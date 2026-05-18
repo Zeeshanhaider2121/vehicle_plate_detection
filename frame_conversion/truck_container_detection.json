@@ -1,0 +1,102 @@
+[
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab appears to be empty and there is no visible shipping container loaded on it.",
+    "summary": "A white truck cab with an empty chassis trailer is in lane 3 at a logistics or inspection area.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 0
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab appears to be an empty chassis as no shipping container is visible.",
+    "summary": "A white truck with an empty chassis parked in lane 3.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 1
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab appears to be empty with no shipping container loaded.",
+    "summary": "A white semi-truck with an empty chassis trailer in lane 3 at 07:06:15 on 04-26-2006.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 2
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer/chassis behind the truck cab appears to be empty as there is no visible rectangular metal box on it.",
+    "summary": "A white semi-truck with an empty trailer/chassis is seen in lane 3 at 7:06 PM on Tuesday, April 26, 2026.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 3
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab appears to be an empty chassis as there is no shipping container visible.",
+    "summary": "A white truck cab pulling an empty chassis in lane 3 at a port or terminal area.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 4
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab is an empty chassis with no shipping container loaded.",
+    "summary": "A white semi-truck with an empty chassis is in lane 3 at a checkpoint.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 5
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "There is a visible empty trailer chassis behind the truck with no shipping container loaded on it.",
+    "summary": "The truck is pulling an empty chassis through a lane at 07:06:18 on Tuesday, April 25, 2006.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 6
+  },
+  {
+    "truck_with_container": false,
+    "confidence": "high",
+    "reasoning": "The trailer behind the truck cab is empty and does not have a shipping container loaded on it.",
+    "summary": "A truck with an empty chassis is shown.",
+    "trailer_type": "empty chassis",
+    "container_color": "none",
+    "frame_index": 7
+  },
+  {
+    "frame_index": 8,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 9,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 10,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 11,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 12,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 13,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  },
+  {
+    "frame_index": 14,
+    "error": "API Error 429: {\"object\":\"error\",\"message\":\"Rate limit exceeded\",\"type\":\"rate_limited\",\"param\":null,\"code\":\"1300\",\"raw_status_code\":429}"
+  }
+]

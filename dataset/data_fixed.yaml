@@ -1,0 +1,13 @@
+train: C:\Users\Admin\Downloads\projects\vehicle_plate_detection\dataset\train\images
+val: C:\Users\Admin\Downloads\projects\vehicle_plate_detection\dataset\valid\images
+test: C:\Users\Admin\Downloads\projects\vehicle_plate_detection\dataset\test\images
+
+nc: 17
+names: ['company_logo', 'container', 'container_company_logo', 'container_number', 'container_side_no', 'driver', 'enterance', 'label_name', 'license_plate', 'multiple_containers', 'other_container_info', 'truck_cabin', 'truck_company', 'truck_number', 'truck_trailer', 'truck_with_container', 'truck_without_container']
+
+roboflow:
+  workspace: zeeshans-workspace-oosca
+  project: my-first-project-oowzs
+  version: 5
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/zeeshans-workspace-oosca/my-first-project-oowzs/dataset/5

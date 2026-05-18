@@ -1,0 +1,16 @@
+label_name,description
+truck_with_container,Truck carrying a shipping container
+truck_without_container,Truck or chassis without container
+truck_cabin,Truck driver cabin / head
+truck_trailer,Empty trailer or chassis
+container,Shipping container
+container_number,Container number / ID
+license_plate,Truck license plate
+company_logo,Trucking company or shipping line logo
+seal,Container seal
+damage,Damage on container or truck
+genset,Genset / Generator set
+hazmat_placard,Hazmat / Hazardous material placard
+reefer_unit,Reefer container unit
+driver,Driver or person
+eir_document,Equipment Interchange Receipt document
