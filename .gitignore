@@ -70,6 +70,9 @@ __pycache__/
 data/
 Dataset_preparation/
 dataset/data/
+dataset/train/
+dataset/valid/
+dataset/test/
 input_frames/
 output/
 results/
