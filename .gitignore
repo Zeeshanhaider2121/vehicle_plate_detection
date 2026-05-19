@@ -83,6 +83,8 @@ results/
 *.onnx
 *.tflite
 *.pb
+*.mp4
+mobileclip2_b.ts
 
 # Frontend artifacts
 frontend/node_modules/
