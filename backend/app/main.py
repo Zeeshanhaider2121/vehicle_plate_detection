@@ -355,6 +355,8 @@ def get_video_job_status(job_id: str) -> VideoAnalyzeStatusResponse:
         total_frames=int(data["total_frames"]) if data.get("total_frames") is not None else None,
         fps=float(data["fps"]) if data.get("fps") is not None else None,
         message=data.get("message"),
+        json_snapshot=data.get("json_snapshot"),
+        ocr_log=data.get("ocr_log") or [],
     )
 
 

@@ -635,10 +635,40 @@ th {
   padding: 4px 8px;
 }
 
+.status-pending {
+  color: #325888;
+  background: #e8f1ff;
+  border-color: #cbddf8;
+}
+
+.status-approved {
+  color: #0f6d4a;
+  background: #def8ec;
+  border-color: #bcecd6;
+}
+
+.status-rejected {
+  color: #923333;
+  background: #ffe9e9;
+  border-color: #f7caca;
+}
+
+.row-rejected {
+  opacity: 0.56;
+}
+
+.row-rejected td {
+  color: #73839d;
+}
+
 .truck-card-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(200px, 1fr));
   gap: 6px 12px;
+}
+
+.truck-card-rejected {
+  opacity: 0.56;
 }
 
 .truck-card-grid p {

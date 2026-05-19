@@ -161,6 +161,8 @@ class VideoAnalyzeStatusResponse(BaseModel):
     total_frames: int | None = None
     fps: float | None = None
     message: str | None = None
+    json_snapshot: str | None = None
+    ocr_log: list[str] = Field(default_factory=list)
 
 
 class VideoAnalyzeFinalizeResponse(BaseModel):

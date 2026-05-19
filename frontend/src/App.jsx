@@ -22,11 +22,11 @@ const menuItems = [
 function readTruckFields(truck) {
   const info = truck?.associated_info || {};
   const pickFirst = (...values) =>
-    values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") || "NOT_DETECTED";
+    values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") || "—";
 
   return {
     trackId: pickFirst(truck?.track_id),
-    truckClass: pickFirst(truck?.truck_type),
+    truckClass: pickFirst(truck?.truck_type, truck?.type),
     container_company_logo: pickFirst(info.container_company_logo),
     container_number: pickFirst(info.container_number),
     container_side_no: pickFirst(info.container_side_no),
@@ -51,6 +51,35 @@ function shortText(value, max = 22) {
   return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
 
+function normalizeTruckFromSnapshot(trackId, truck) {
+  const safeTrackId = Number(trackId ?? truck?.track_id);
+  return {
+    id: `track-${safeTrackId}`,
+    track_id: safeTrackId,
+    truck_type: truck?.type || "—",
+    first_seen_frame: truck?.first_seen_frame ?? null,
+    last_seen_frame: truck?.last_seen_frame ?? null,
+    first_seen_time_sec: truck?.first_seen_time_sec ?? null,
+    last_seen_time_sec: truck?.last_seen_time_sec ?? null,
+    duration_frames: truck?.duration_frames ?? null,
+    duration_sec: truck?.duration_sec ?? null,
+    confidence_avg: truck?.confidence_avg ?? null,
+    last_bbox: truck?.last_bbox ?? null,
+    associated_info: truck?.associated_info || {},
+    review_status: "pending"
+  };
+}
+
+function normalizeTruckFromDb(truck) {
+  return {
+    ...truck,
+    id: `track-${truck?.track_id}`,
+    truck_type: truck?.truck_type || truck?.type || "—",
+    associated_info: truck?.associated_info || {},
+    review_status: "pending"
+  };
+}
+
 export default function App() {
   const [videoFile, setVideoFile] = useState(null);
   const [analysisJsonFile, setAnalysisJsonFile] = useState(null);
@@ -64,8 +93,13 @@ export default function App() {
   const [streamFrameUrl, setStreamFrameUrl] = useState("");
   const [streamWarning, setStreamWarning] = useState("");
   const [streamErrorCount, setStreamErrorCount] = useState(0);
+  const [selectedTruckId, setSelectedTruckId] = useState("");
 
-  const currentTruck = detectedTrucks.find((truck) => truck.review_status === "pending") || detectedTrucks[reviewIndex] || null;
+  const currentTruck =
+    detectedTrucks.find((truck) => truck.id === selectedTruckId) ||
+    detectedTrucks.find((truck) => truck.review_status === "pending") ||
+    detectedTrucks[reviewIndex] ||
+    null;
   const currentFields = useMemo(() => readTruckFields(currentTruck), [currentTruck]);
 
   const counts = useMemo(() => {
@@ -84,6 +118,30 @@ export default function App() {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function mergeSnapshotRows(snapshotTrucks) {
+    if (!snapshotTrucks || typeof snapshotTrucks !== "object") return;
+    setDetectedTrucks((prev) => {
+      const byId = new Map(prev.map((truck) => [truck.id, truck]));
+
+      for (const [trackId, payload] of Object.entries(snapshotTrucks)) {
+        const incoming = normalizeTruckFromSnapshot(trackId, payload);
+        const existing = byId.get(incoming.id);
+        if (!existing) {
+          byId.set(incoming.id, incoming);
+          continue;
+        }
+        byId.set(incoming.id, {
+          ...existing,
+          ...incoming,
+          review_status: existing.review_status || "pending"
+        });
+      }
+
+      const merged = [...byId.values()].sort((a, b) => Number(a.track_id) - Number(b.track_id));
+      return merged;
+    });
+  }
+
   async function pollJobUntilComplete(jobId) {
     const maxPolls = 900;
     for (let i = 0; i < maxPolls; i += 1) {
@@ -95,6 +153,14 @@ export default function App() {
       if (frame > 0) {
         setStreamFrameUrl(`${getVideoTruckRunFrameUrl(jobId)}?ts=${Date.now()}`);
       }
+      if (status.json_snapshot) {
+        try {
+          const snap = JSON.parse(status.json_snapshot);
+          mergeSnapshotRows(snap?.trucks || {});
+        } catch {
+          // Ignore malformed snapshots and continue polling.
+        }
+      }
 
       if (status.state === "completed") {
         return;
@@ -102,7 +168,7 @@ export default function App() {
       if (status.state === "failed") {
         throw new Error(status.message || "Video processing failed.");
       }
-      await sleep(1500);
+      await sleep(2000);
     }
     throw new Error("Video processing timed out while waiting for completion.");
   }
@@ -116,6 +182,11 @@ export default function App() {
     setLoading(true);
     setMessage("");
     try {
+      setDetectedTrucks([]);
+      setSelectedTruckId("");
+      setReviewIndex(0);
+      setActiveJobId("");
+      setStreamFrameUrl("");
       setMessage(`File uploaded: ${videoFile.name}. Starting GPU processing...`);
       setStreamWarning("");
       setStreamErrorCount(0);
@@ -135,6 +206,7 @@ export default function App() {
         const finalized = await finalizeVideoTruckRun(jobId);
         currentRunId = finalized.run_id;
         storedTrucks = finalized.stored_trucks;
+        setActiveJobId("");
       }
 
       if (!currentRunId) {
@@ -144,13 +216,21 @@ export default function App() {
       setRunId(currentRunId);
 
       const trucksResult = await fetchTruckRecords(currentRunId, "");
-      setDetectedTrucks(
-        (trucksResult.items || []).map((truck) => ({
-          ...truck,
-          review_status: "pending"
-        }))
-      );
-      setReviewIndex(0);
+      const dbTrucks = (trucksResult.items || []).map((truck) => normalizeTruckFromDb(truck));
+      if (dbTrucks.length > 0) {
+        setDetectedTrucks((prev) => {
+          const byId = new Map(prev.map((truck) => [truck.id, truck]));
+          for (const dbTruck of dbTrucks) {
+            const existing = byId.get(dbTruck.id);
+            byId.set(dbTruck.id, {
+              ...(existing || {}),
+              ...dbTruck,
+              review_status: existing?.review_status || "pending"
+            });
+          }
+          return [...byId.values()].sort((a, b) => Number(a.track_id) - Number(b.track_id));
+        });
+      }
 
       setMessage(
         `Detection loaded from model output. Run ID: ${currentRunId}. Trucks detected: ${
@@ -169,6 +249,7 @@ export default function App() {
     const targetId = truckId ?? currentTruck?.id;
     if (!targetId) return;
 
+    setSelectedTruckId(targetId);
     const updated = detectedTrucks.map((truck) =>
       truck.id === targetId ? { ...truck, review_status: "approved" } : truck
     );
@@ -183,6 +264,7 @@ export default function App() {
     const targetId = truckId ?? currentTruck?.id;
     if (!targetId) return;
 
+    setSelectedTruckId(targetId);
     const updated = detectedTrucks.map((truck) =>
       truck.id === targetId ? { ...truck, review_status: "rejected" } : truck
     );
@@ -361,10 +443,20 @@ export default function App() {
               </div>
 
               <div className="approval-row">
-                <button type="button" className="approve-btn" onClick={handleApprove} disabled={!currentTruck}>
+                <button
+                  type="button"
+                  className="approve-btn"
+                  onClick={handleApprove}
+                  disabled={!currentTruck || currentTruck.review_status === "rejected"}
+                >
                   Approve
                 </button>
-                <button type="button" className="reject-btn" onClick={handleReject} disabled={!currentTruck}>
+                <button
+                  type="button"
+                  className="reject-btn"
+                  onClick={handleReject}
+                  disabled={!currentTruck || currentTruck.review_status === "rejected"}
+                >
                   Reject
                 </button>
               </div>
@@ -482,9 +574,12 @@ export default function App() {
                     )}
                     {detectedTrucks.map((truck) => {
                       const fields = readTruckFields(truck);
+                      const status = truck.review_status || "pending";
                       return (
-                        <tr key={truck.id}>
-                          <td>{truck.review_status || "pending"}</td>
+                        <tr key={truck.id} className={status === "rejected" ? "row-rejected" : ""}>
+                          <td>
+                            <span className={`status-chip status-${status}`}>{status}</span>
+                          </td>
                           <td>{fields.trackId}</td>
                           <td><span className="cell-truncate" title={fields.truckClass}>{shortText(fields.truckClass, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 24)}</span></td>
@@ -508,7 +603,7 @@ export default function App() {
                                 type="button"
                                 className="mini-approve"
                                 onClick={() => handleApprove(truck.id)}
-                                disabled={truck.review_status === "approved"}
+                                disabled={status === "rejected"}
                               >
                                 Approve
                               </button>
@@ -516,7 +611,7 @@ export default function App() {
                                 type="button"
                                 className="mini-reject"
                                 onClick={() => handleReject(truck.id)}
-                                disabled={truck.review_status === "rejected"}
+                                disabled={status === "rejected"}
                               >
                                 Reject
                               </button>
@@ -533,11 +628,12 @@ export default function App() {
                 {detectedTrucks.length === 0 && <div className="empty-cell">No detected trucks yet.</div>}
                 {detectedTrucks.map((truck) => {
                   const fields = readTruckFields(truck);
+                  const status = truck.review_status || "pending";
                   return (
-                    <article key={truck.id} className="truck-card">
+                    <article key={truck.id} className={`truck-card ${status === "rejected" ? "truck-card-rejected" : ""}`}>
                       <div className="truck-card-head">
                         <strong>Truck #{fields.trackId}</strong>
-                        <span className="status-chip">{truck.review_status || "pending"}</span>
+                        <span className={`status-chip status-${status}`}>{status}</span>
                       </div>
                       <div className="truck-card-grid">
                         <p><b>truck_class:</b> {fields.truckClass}</p>
@@ -558,7 +654,7 @@ export default function App() {
                           type="button"
                           className="mini-approve"
                           onClick={() => handleApprove(truck.id)}
-                          disabled={truck.review_status === "approved"}
+                          disabled={status === "rejected"}
                         >
                           Approve
                         </button>
@@ -566,7 +662,7 @@ export default function App() {
                           type="button"
                           className="mini-reject"
                           onClick={() => handleReject(truck.id)}
-                          disabled={truck.review_status === "rejected"}
+                          disabled={status === "rejected"}
                         >
                           Reject
                         </button>
