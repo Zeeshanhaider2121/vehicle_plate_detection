@@ -48,23 +48,50 @@ const menuItems = [
   "Pre-Arrive Admin"
 ];
 
+function readOcrFieldValue(value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value.text) return value.text;
+  return "—";
+}
+
+function readOcrFieldConfidence(value) {
+  if (typeof value === "object" && value.confidence != null) return value.confidence;
+  return null;
+}
+
 function readTruckFields(truck) {
   const info = truck?.associated_info || {};
   const pickFirst = (...values) =>
     values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") || "—";
 
+  const ocrFields = [
+    "container_company_logo", "container_number", "container_side_no",
+    "driver", "license_plate", "other_container_info",
+    "truck_company", "truck_number"
+  ];
+  const fieldTexts = {};
+  const fieldConfs = {};
+  for (const f of ocrFields) {
+    fieldTexts[f] = readOcrFieldValue(info[f]);
+    const c = readOcrFieldConfidence(info[f]);
+    fieldConfs[f] = c != null ? c.toFixed(3) : "—";
+  }
+  // Calculate per-truck confidence: use min OCR confidence among filled fields
+  const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
+  const minOcrConf = ocrConfs.length > 0 ? Math.min(...ocrConfs).toFixed(3) : "—";
+
   return {
     trackId: pickFirst(truck?.track_id),
     truckClass: pickFirst(truck?.truck_type, truck?.type),
-    container_company_logo: pickFirst(info.container_company_logo),
-    container_number: pickFirst(info.container_number),
-    container_side_no: pickFirst(info.container_side_no),
-    driver: pickFirst(info.driver),
-    license_plate: pickFirst(info.license_plate),
-    other_container_info: pickFirst(info.other_container_info),
-    truck_company: pickFirst(info.truck_company),
-    truck_number: pickFirst(info.truck_number),
+    ...fieldTexts,
+    ...Object.fromEntries(Object.entries(fieldConfs).map(([k, v]) => [k + "_conf", v])),
+    driver: fieldTexts.driver,
+    license_plate: fieldTexts.license_plate,
+    truck_company: fieldTexts.truck_company,
+    truck_number: fieldTexts.truck_number,
     confidence: pickFirst(truck?.confidence_avg),
+    ocr_confidence: minOcrConf,
     durationSec: pickFirst(truck?.duration_sec),
     firstSeen: pickFirst(truck?.first_seen_time_sec),
     lastSeen: pickFirst(truck?.last_seen_time_sec),
@@ -669,6 +696,7 @@ export default function App() {
                       <th>other_container_info</th>
                       <th>truck_company</th>
                       <th>truck_number</th>
+                      <th>ocr_conf</th>
                       <th>confidence_avg</th>
                       <th>duration_sec</th>
                       <th>first_seen_time_sec</th>
@@ -682,8 +710,8 @@ export default function App() {
                   <tbody>
                     {detectedTrucks.length === 0 && (
                       <tr>
-                        <td colSpan={19} className="empty-cell">
-                          No detected trucks yet.
+                          <td colSpan={20} className="empty-cell">
+                            No detected trucks yet.
                         </td>
                       </tr>
                     )}
@@ -705,6 +733,7 @@ export default function App() {
                           <td><span className="cell-truncate" title={fields.other_container_info}>{shortText(fields.other_container_info, 26)}</span></td>
                           <td><span className="cell-truncate" title={fields.truck_company}>{shortText(fields.truck_company, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.truck_number}>{shortText(fields.truck_number, 24)}</span></td>
+                          <td>{fields.ocr_confidence}</td>
                           <td>{fields.confidence}</td>
                           <td>{fields.durationSec}</td>
                           <td>{fields.firstSeen}</td>
@@ -760,6 +789,7 @@ export default function App() {
                         <p><b>container_number:</b> {fields.container_number}</p>
                         <p><b>container_side_no:</b> {fields.container_side_no}</p>
                         <p><b>other_container_info:</b> {fields.other_container_info}</p>
+                        <p><b>ocr_confidence:</b> {fields.ocr_confidence}</p>
                         <p><b>confidence_avg:</b> {fields.confidence}</p>
                         <p><b>duration_sec:</b> {fields.durationSec}</p>
                         <p><b>last_bbox:</b> {shortText(fields.bbox, 40)}</p>
