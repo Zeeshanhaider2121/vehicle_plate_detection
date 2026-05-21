@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import {
   fetchTruckRecords,
   finalizeVideoTruckRun,
@@ -6,6 +6,35 @@ import {
   getVideoTruckRunStatus,
   startVideoTruckRun
 } from "./api";
+
+const BLURRY_KEYWORDS = [
+  "blurr", "indistinct", "unrecognizable", "no discernible",
+  "no visible", "unreadable", "cannot be determined",
+  "not visible", "unclear", "unable to", "no text"
+];
+
+function isBlurry(text) {
+  if (!text) return false;
+  const t = String(text).toLowerCase();
+  return BLURRY_KEYWORDS.some(kw => t.includes(kw)) || t.length > 60;
+}
+
+function mergeInfo(existing, incoming) {
+  const result = { ...(existing || {}) };
+  for (const key of Object.keys(incoming || {})) {
+    const inc = incoming[key];
+    const ext = result[key];
+    if (inc === null || inc === undefined || inc === "") continue;
+    if (!ext || ext === "" || ext === null || ext === undefined) {
+      result[key] = inc;
+      continue;
+    }
+    if (isBlurry(inc) && !isBlurry(ext)) continue;
+    if (!isBlurry(inc) && isBlurry(ext)) { result[key] = inc; continue; }
+    if (String(inc).length < String(ext).length) result[key] = inc;
+  }
+  return result;
+}
 
 const menuItems = [
   "Arrive Unit",
@@ -51,21 +80,42 @@ function shortText(value, max = 22) {
   return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
 
+function stripOcrMarkdown(value) {
+  if (!value || typeof value !== "string") return value;
+  // Remove markdown image ![alt](path)
+  let cleaned = value.replace(/!\[.*?\]\(.*?\)\s*/g, "");
+  // Remove HTML tags
+  cleaned = cleaned.replace(/<[^>]+>/g, " ");
+  // Collapse whitespace and trim
+  cleaned = cleaned.replace(/\s+/g, " ").trim();
+  // If nothing intelligible remains, return a short fallback
+  return cleaned || (value.length > 80 ? value.slice(0, 77) + "..." : value);
+}
+
 function normalizeTruckFromSnapshot(trackId, truck) {
-  const safeTrackId = Number(trackId ?? truck?.track_id);
+  const safeTrackId = Number(trackId ?? truck?.tid ?? truck?.track_id);
+
+  // The real Colab server returns { tid, type, first, last, conf, info }
+  // rather than { track_id, type, first_seen_frame, ... associated_info }
+  const rawInfo = truck?.info || truck?.associated_info || {};
+  const cleanedInfo = {};
+  for (const [k, v] of Object.entries(rawInfo)) {
+    cleanedInfo[k] = stripOcrMarkdown(v);
+  }
+
   return {
     id: `track-${safeTrackId}`,
     track_id: safeTrackId,
     truck_type: truck?.type || "—",
-    first_seen_frame: truck?.first_seen_frame ?? null,
-    last_seen_frame: truck?.last_seen_frame ?? null,
+    first_seen_frame: truck?.first ?? truck?.first_seen_frame ?? null,
+    last_seen_frame: truck?.last ?? truck?.last_seen_frame ?? null,
     first_seen_time_sec: truck?.first_seen_time_sec ?? null,
     last_seen_time_sec: truck?.last_seen_time_sec ?? null,
     duration_frames: truck?.duration_frames ?? null,
     duration_sec: truck?.duration_sec ?? null,
-    confidence_avg: truck?.confidence_avg ?? null,
+    confidence_avg: truck?.conf ?? truck?.confidence_avg ?? null,
     last_bbox: truck?.last_bbox ?? null,
-    associated_info: truck?.associated_info || {},
+    associated_info: cleanedInfo,
     review_status: "pending"
   };
 }
@@ -94,6 +144,21 @@ export default function App() {
   const [streamWarning, setStreamWarning] = useState("");
   const [streamErrorCount, setStreamErrorCount] = useState(0);
   const [selectedTruckId, setSelectedTruckId] = useState("");
+  const [processStatus, setProcessStatus] = useState("idle");
+  const [videoPlaying, setVideoPlaying] = useState(true);
+  const [ocrLog, setOcrLog] = useState([]);
+  const videoRef = useRef(null);
+
+  function toggleVideo() {
+    if (!videoRef.current) return;
+    if (videoRef.current.paused) {
+      videoRef.current.play();
+      setVideoPlaying(true);
+    } else {
+      videoRef.current.pause();
+      setVideoPlaying(false);
+    }
+  }
 
   const currentTruck =
     detectedTrucks.find((truck) => truck.id === selectedTruckId) ||
@@ -133,6 +198,7 @@ export default function App() {
         byId.set(incoming.id, {
           ...existing,
           ...incoming,
+          associated_info: mergeInfo(existing.associated_info, incoming.associated_info),
           review_status: existing.review_status || "pending"
         });
       }
@@ -144,8 +210,25 @@ export default function App() {
 
   async function pollJobUntilComplete(jobId) {
     const maxPolls = 900;
+    const maxRetries = 5;
+    const maxCachedPolls = 15;
+    let retries = 0;
+    let cachedPolls = 0;
+
     for (let i = 0; i < maxPolls; i += 1) {
-      const status = await getVideoTruckRunStatus(jobId);
+      let status;
+      try {
+        status = await getVideoTruckRunStatus(jobId);
+      } catch {
+        retries += 1;
+        if (retries <= maxRetries) {
+          await sleep(2000);
+          continue;
+        }
+        throw new Error("Video processing backend unreachable after retries.");
+      }
+      retries = 0;
+
       const total = status.total_frames ?? "?";
       const frame = status.frame_id ?? 0;
       const pct = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
@@ -153,6 +236,13 @@ export default function App() {
       if (frame > 0) {
         setStreamFrameUrl(`${getVideoTruckRunFrameUrl(jobId)}?ts=${Date.now()}`);
       }
+      if (status.ocr_log && status.ocr_log.length > 0) {
+        setOcrLog((prev) => {
+          const combined = [...prev, ...status.ocr_log];
+          return combined.slice(-50);
+        });
+      }
+
       if (status.json_snapshot) {
         try {
           const snap = JSON.parse(status.json_snapshot);
@@ -165,6 +255,15 @@ export default function App() {
       if (status.state === "completed") {
         return;
       }
+      if (status.state === "cached") {
+        cachedPolls += 1;
+        if (cachedPolls > maxCachedPolls) {
+          throw new Error("Colab stub is down; last cached snapshot is shown above.");
+        }
+        await sleep(2000);
+        continue;
+      }
+      cachedPolls = 0;
       if (status.state === "failed") {
         throw new Error(status.message || "Video processing failed.");
       }
@@ -181,6 +280,7 @@ export default function App() {
 
     setLoading(true);
     setMessage("");
+    setProcessStatus("uploading");
     try {
       setDetectedTrucks([]);
       setSelectedTruckId("");
@@ -202,6 +302,7 @@ export default function App() {
         }
         setActiveJobId(jobId);
         setMessage(`Video job started (${jobId.slice(0, 8)}). Processing on Colab GPU...`);
+        setProcessStatus("processing");
         await pollJobUntilComplete(jobId);
         const finalized = await finalizeVideoTruckRun(jobId);
         currentRunId = finalized.run_id;
@@ -225,6 +326,7 @@ export default function App() {
             byId.set(dbTruck.id, {
               ...(existing || {}),
               ...dbTruck,
+              associated_info: mergeInfo(existing?.associated_info, dbTruck.associated_info),
               review_status: existing?.review_status || "pending"
             });
           }
@@ -232,6 +334,7 @@ export default function App() {
         });
       }
 
+      setProcessStatus("complete");
       setMessage(
         `Detection loaded from model output. Run ID: ${currentRunId}. Trucks detected: ${
           storedTrucks
@@ -239,6 +342,7 @@ export default function App() {
       );
       setStreamWarning("");
     } catch (error) {
+      setProcessStatus("error");
       setMessage(error?.response?.data?.detail || "Video upload or detection import failed.");
     } finally {
       setLoading(false);
@@ -311,7 +415,6 @@ export default function App() {
 
       <main className="workspace">
         <header className="topbar">
-          <div className="search-box">Search Logistics Matrix...</div>
           <div className="top-links">
             <span>Help &amp; Support</span>
             <span>Analytics</span>
@@ -339,24 +442,6 @@ export default function App() {
                 <p>{pendingCount} Pending</p>
               </div>
             </div>
-          </div>
-
-          <div className="upload-strip">
-            <label className="upload-item">
-              Upload Video
-              <input type="file" accept="video/*" onChange={(event) => setVideoFile(event.target.files?.[0] || null)} />
-            </label>
-            <label className="upload-item">
-              Upload Model JSON (optional)
-              <input
-                type="file"
-                accept=".json,application/json"
-                onChange={(event) => setAnalysisJsonFile(event.target.files?.[0] || null)}
-              />
-            </label>
-            <button type="button" className="action-btn" onClick={handleVideoUpload} disabled={loading}>
-              {loading ? "Processing..." : "Upload And Detect"}
-            </button>
           </div>
 
           {message && <div className="message-banner">{message}</div>}
@@ -465,13 +550,9 @@ export default function App() {
             <aside className="stream-pane">
               <div className="stream-head">
                 <span>DEMO STREAM</span>
-                <div className="stream-actions">
-                  <button type="button">II</button>
-                  <button type="button">[]</button>
-                </div>
               </div>
               <div className="stream-view">
-                {streamFrameUrl ? (
+                {activeJobId && streamFrameUrl ? (
                   <img
                     src={streamFrameUrl}
                     alt="Live detection stream"
@@ -486,28 +567,62 @@ export default function App() {
                       }
                     }}
                     onLoad={() => {
-                      if (streamWarning) {
-                        setStreamWarning("");
-                      }
-                      if (streamErrorCount > 0) {
-                        setStreamErrorCount(0);
-                      }
+                      if (streamWarning) setStreamWarning("");
+                      if (streamErrorCount > 0) setStreamErrorCount(0);
                     }}
                   />
                 ) : (
-                  <div className="overlay-text">
-                    {activeJobId
-                      ? `JOB ${activeJobId.slice(0, 8)} RUNNING...`
-                      : currentTruck
-                        ? `REVIEWING TRUCK ${currentTruck.track_id}`
-                        : "SYSTEM AWAITING VIDEO ANALYSIS"}
-                  </div>
+                  <video
+                    ref={videoRef}
+                    className="stream-video"
+                    autoPlay
+                    muted
+                    loop
+                    playsInline
+                    src="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+                  />
                 )}
               </div>
-              {streamWarning && <div className="stream-warning">{streamWarning}</div>}
-              <button className="scan-btn" type="button">
-                +
-              </button>
+              <div className="stream-controls">
+                <button type="button" className="play-pause-btn" onClick={toggleVideo}>
+                  {videoPlaying ? "⏸ Pause" : "▶ Play"}
+                </button>
+              </div>
+              <div className={`process-status status-${processStatus}`}>
+                <span className="status-dot" />
+                <span className="status-label">
+                  {processStatus === "idle" && "Awaiting Video Upload"}
+                  {processStatus === "uploading" && "Uploading Video..."}
+                  {processStatus === "processing" && "Processing Detection..."}
+                  {processStatus === "complete" && "Detection Complete"}
+                  {processStatus === "error" && "Processing Failed"}
+                </span>
+              </div>
+              <div className="stream-upload-row">
+                <label className="upload-label">
+                  Upload Video
+                  <input
+                    type="file"
+                    accept="video/*"
+                    onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
+                  />
+                </label>
+                <button type="button" className="detect-btn" onClick={handleVideoUpload} disabled={loading}>
+                  {loading ? "Detecting..." : "Detect"}
+                </button>
+              </div>
+              {ocrLog.length > 0 && (
+                <div className="ocr-log-panel">
+                  <div className="ocr-log-head">LIVE OCR LOG</div>
+                  <div className="ocr-log-scroll">
+                    {ocrLog.slice(-10).map((line, idx) => (
+                      <div key={idx} className={`ocr-log-line ${line.includes('LOCKED') ? 'log-locked' : line.includes('VOTE') ? 'log-vote' : line.includes('BEST') ? 'log-best' : line.includes('orphan') ? 'log-orphan' : ''}`}>
+                        {line}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </aside>
           </div>
 

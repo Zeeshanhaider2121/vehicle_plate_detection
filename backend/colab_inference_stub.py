@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import random
 import io
 import json
 import os
@@ -38,10 +38,14 @@ USE_HALF          = True
 OCR_WORKERS       = 3
 SAVE_CROPS        = False
 MIN_ASSOC_SCORE   = 0.10
+MIN_TRUCK_AREA    = 40_000
 JSON_SNAP_EVERY   = 30
-MINERU_TOKEN="eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI3NzgwMDYzMyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3OTExMzIyNiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiNWIxM2U3YjctN2FmNi00MzdjLThhZmEtMTIxNTRiMzQyOGQxIiwiZW1haWwiOiIiLCJleHAiOjE3ODY4ODkyMjZ9.gw3idlGC_R1ulaBBXCR_FtVszMw3y7jIbFBwQcjhgCbqVNJaoXTvtUp7GdvpMF117PPbzn1xrqm8YIybpxMN_Q"
+OCR_RETRY_EVERY   = 45
 
+# ── Association locking from snippet 1 ───────────────────────────────────────
+LOCK_AFTER_N_FRAMES = 5  # Lock after N consecutive frames with same truck
 
+MINERU_TOKEN = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI3NzgwMDYzMyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3OTExMzIyNiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiNWIxM2U3YjctN2FmNi00MzdjLThhZmEtMTIxNTRiMzQyOGQxIiwiZW1haWwiOiIiLCJleHAiOjE3ODY4ODkyMjZ9.gw3idlGC_R1ulaBBXCR_FtVszMw3y7jIbFBwQcjhgCbqVNJaoXTvtUp7GdvpMF117PPbzn1xrqm8YIybpxMN_Q"
 
 CLASS_NAMES = [
     "container_company_logo",
@@ -55,7 +59,7 @@ CLASS_NAMES = [
     "truck_with_container",
     "truck_without_container",
 ]
- 
+
 TRUCK_CLASSES = {"truck_with_container", "truck_without_container"}
 OCR_CLASSES = {
     "container_number",
@@ -77,34 +81,33 @@ TRUCK_WITHOUT_CONTAINER_FIELDS = {
     "truck_number",
 }
 CHILD_CLASSES = TRUCK_WITH_CONTAINER_FIELDS | TRUCK_WITHOUT_CONTAINER_FIELDS
- 
-# ── Per-class colour palette — identical to snippet 2 ─────────────────────────
+
 random.seed(42)
 PALETTE: dict[int, tuple[int, int, int]] = {
     i: tuple(random.randint(60, 230) for _ in range(3))   # type: ignore[assignment]
     for i in range(len(CLASS_NAMES))
 }
- 
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 if SAVE_CROPS:
     os.makedirs(os.path.join(OUTPUT_DIR, "ocr_crops"), exist_ok=True)
- 
+
 # ========================= APP + MODEL =======================================
-app = FastAPI(title="PlateFlow Colab GPU API", version="3.1.0")
- 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+app = FastAPI(title="PlateFlow Colab GPU API", version="3.5.0")
+
+DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 USE_HALF = USE_HALF if DEVICE == "cuda" else False
-model = YOLO(MODEL_PATH)
+model    = YOLO(MODEL_PATH)
 model.to(DEVICE)
 _dummy = np.zeros((640, 640, 3), dtype=np.uint8)
 model.predict(_dummy, verbose=False, half=USE_HALF, device=DEVICE)
 del _dummy
- 
+
 # ========================= DATA STRUCTS ======================================
 _jobs_lock = threading.Lock()
 _ocr_queue: queue.Queue = queue.Queue()
- 
- 
+
+
 @dataclass
 class VideoJob:
     job_id: str
@@ -125,18 +128,31 @@ class VideoJob:
     json_snapshot: str = "{}"
     session_info: dict[str, Any] = field(default_factory=dict)
     registry: Any | None = None
- 
- 
+    sticky_assoc: dict[int, tuple[int, str, str]] = field(default_factory=dict)
+    
+    # ── Association locking state (from snippet 1) ───────────────────────────
+    # Permanent association map (locked after LOCK_AFTER_N_FRAMES)
+    # key: child track_id, value: {"truck_tid": int, "truck_type": str, "field": str}
+    child_to_truck: dict[int, dict[str, Any]] = field(default_factory=dict)
+    
+    # Voting buffer (temporary, discarded after lock)
+    # key: child track_id, value: {"truck_tid": int, "truck_type": str, "field": str, "count": int}
+    child_assoc_votes: dict[int, dict[str, Any]] = field(default_factory=dict)
+    
+    # Best confidence tracker per (cls_name, track_id)
+    ocr_best_conf: dict[tuple[str, int], float] = field(default_factory=dict)
+
+
 JOBS: dict[str, VideoJob] = {}
- 
- 
+
+
 def _set_job(job_id: str, **kwargs: Any) -> None:
     with _jobs_lock:
         job = JOBS[job_id]
         for key, value in kwargs.items():
             setattr(job, key, value)
- 
- 
+
+
 # ========================= SPATIAL HELPERS ===================================
 def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     x_a, y_a = max(a[0], b[0]), max(a[1], b[1])
@@ -147,8 +163,8 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     inter = i_w * i_h
     union = ((a[2] - a[0]) * (a[3] - a[1])) + ((b[2] - b[0]) * (b[3] - b[1])) - inter
     return inter / union if union > 0 else 0.0
- 
- 
+
+
 def _containment(child: tuple[int, int, int, int], parent: tuple[int, int, int, int]) -> float:
     x_a, y_a = max(child[0], parent[0]), max(child[1], parent[1])
     x_b, y_b = min(child[2], parent[2]), min(child[3], parent[3])
@@ -157,33 +173,140 @@ def _containment(child: tuple[int, int, int, int], parent: tuple[int, int, int, 
         return 0.0
     child_area = (child[2] - child[0]) * (child[3] - child[1])
     return (i_w * i_h) / child_area if child_area > 0 else 0.0
- 
- 
-def _build_association_map(boxes_data: list[tuple]) -> dict[int, tuple[int, str, str]]:
-    truck_list = []
-    child_list = []
+
+
+def _update_association_votes(
+    job: VideoJob,
+    track_id: int,
+    cls_name: str,
+    truck_tid: int,
+    truck_type: str
+) -> None:
+    """
+    Called every frame a child detection has a valid spatial association.
+    Accumulates votes. Locks the association after LOCK_AFTER_N_FRAMES
+    consecutive agreements on the same truck.
+
+    Flow:
+        Frame 1: first seen → start vote (count=1)
+        Frame 2: same truck → count=2
+        Frame 3: different truck → RESET (count=1 for new truck)
+        Frame 4: same truck as frame 3 → count=2
+        ...
+        Frame N: count reaches LOCK_AFTER_N_FRAMES → LOCKED permanently
+    """
+    # Already locked → nothing to do
+    if track_id in job.child_to_truck:
+        return
+
+    vote = job.child_assoc_votes.get(track_id)
+
+    if vote is None:
+        # First time we see this child → start fresh vote
+        job.child_assoc_votes[track_id] = {
+            "truck_tid": truck_tid,
+            "truck_type": truck_type,
+            "field": cls_name,
+            "count": 1,
+        }
+        print(f"  [VOTE] child T#{track_id} ({cls_name}) "
+              f"→ Truck T#{truck_tid}  count=1")
+
+    elif vote["truck_tid"] == truck_tid:
+        # Same truck wins again → increment
+        vote["count"] += 1
+        print(f"  [VOTE] child T#{track_id} ({cls_name}) "
+              f"→ Truck T#{truck_tid}  count={vote['count']}/{LOCK_AFTER_N_FRAMES}")
+
+        if vote["count"] >= LOCK_AFTER_N_FRAMES:
+            # ── LOCK the association permanently ─────────────────────────────
+            job.child_to_truck[track_id] = {
+                "truck_tid": truck_tid,
+                "truck_type": truck_type,
+                "field": cls_name,
+            }
+            del job.child_assoc_votes[track_id]
+            print(f"  [LOCKED] ✅ child T#{track_id} ({cls_name}) "
+                  f"→ Truck T#{truck_tid} ({truck_type}) "
+                  f"after {LOCK_AFTER_N_FRAMES} frames")
+
+    else:
+        # Different truck won this frame → reset vote for new truck
+        print(f"  [VOTE] child T#{track_id} ({cls_name}) "
+              f"RESET: was T#{vote['truck_tid']}, now T#{truck_tid}")
+        job.child_assoc_votes[track_id] = {
+            "truck_tid": truck_tid,
+            "truck_type": truck_type,
+            "field": cls_name,
+            "count": 1,
+        }
+
+
+def _build_association_map_integrated(
+    boxes_data: list[tuple],
+    job: VideoJob | None = None,
+) -> dict[int, tuple[int, str, str]]:
+    """
+    Two-stage resolution with locking from snippet 1:
+    1. First check if child is already LOCKED → always use locked truck
+    2. Otherwise perform spatial association and update voting
+    3. Fallback to sticky cache if spatial fails
+    """
+    truck_list: list[tuple[tuple, int, str]] = []
+    child_list: list[tuple[int, tuple, str, int | None]] = []
+
     for i, (x1, y1, x2, y2, cls_id, _, tid, _mask) in enumerate(boxes_data):
         cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
         box = (x1, y1, x2, y2)
         if cls_name in TRUCK_CLASSES and tid is not None:
             truck_list.append((box, tid, cls_name))
         elif cls_name in CHILD_CLASSES:
-            child_list.append((i, box, cls_name))
- 
+            child_list.append((i, box, cls_name, tid))
+
     assoc: dict[int, tuple[int, str, str]] = {}
-    for child_idx, child_box, child_cls in child_list:
+
+    for child_idx, child_box, child_cls, child_tid in child_list:
+        # Skip if no track_id
+        if child_tid is None:
+            continue
+
+        # Stage 0: Check if permanently locked
+        if job is not None and child_tid in job.child_to_truck:
+            locked = job.child_to_truck[child_tid]
+            assoc[child_idx] = (locked["truck_tid"], locked["truck_type"], locked["field"])
+            continue
+
+        # Stage 1: Spatial association (only for unlocked children)
         best_score = 0.0
-        best_match = None
+        best_match: tuple[int, str, str] | None = None
         for truck_box, truck_tid, truck_type in truck_list:
             score = max(_containment(child_box, truck_box), _iou(child_box, truck_box))
             if score > best_score:
                 best_score = score
                 best_match = (truck_tid, truck_type, child_cls)
+
         if best_match and best_score >= MIN_ASSOC_SCORE:
             assoc[child_idx] = best_match
+            # Update voting for unlocked children
+            if job is not None:
+                _update_association_votes(job, child_tid, child_cls, best_match[0], best_match[1])
+
+        # Stage 2: Sticky fallback (only if not locked and spatial failed)
+        elif job is not None and child_tid in job.sticky_assoc:
+            sticky = job.sticky_assoc[child_tid]
+            assoc[child_idx] = sticky
+
     return assoc
- 
- 
+
+
+# ========================= TEXT QUALITY ======================================
+def _text_quality(text: str) -> float:
+    if not text:
+        return 0.0
+    good = sum(1 for c in text if c.isalnum() or c in " -/.")
+    return good / len(text)
+
+
 # ========================= TRUCK REGISTRY ====================================
 class TruckRegistry:
     _WITH_CONTAINER_TEMPLATE = {
@@ -197,12 +320,12 @@ class TruckRegistry:
         "truck_company": None,
         "truck_number": None,
     }
- 
+
     def __init__(self, fps: float) -> None:
         self.fps = max(fps, 1.0)
         self.trucks: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
- 
+
     def _new_record(
         self,
         tid: int,
@@ -230,7 +353,7 @@ class TruckRegistry:
             "last_bbox": list(bbox),
             "associated_info": {k: v for k, v in template.items()},
         }
- 
+
     def update(
         self,
         track_id: int,
@@ -254,15 +377,8 @@ class TruckRegistry:
             n = rec["_conf_n"]
             rec["confidence_avg"] = round((rec["confidence_avg"] * n + conf) / (n + 1), 4)
             rec["_conf_n"] = n + 1
- 
+
     def attach_ocr(self, truck_track_id: int, truck_type: str, field: str, text: str) -> None:
-        """
-        Write an OCR result into the truck's associated_info.
-        Rules (identical to snippet 2):
-          • container fields  → only on truck_with_container
-          • plate/logo fields → only on truck_without_container
-          • Longer text wins on conflict
-        """
         if not text:
             return
         with self._lock:
@@ -270,12 +386,49 @@ class TruckRegistry:
             if rec is None:
                 return
             info = rec["associated_info"]
-            if field not in info:          # wrong truck type — skip
+            if field not in info:
                 return
             existing = info.get(field) or ""
-            if len(text) > len(existing):  # prefer longer, more complete text
+            if not existing:
                 info[field] = text
- 
+                return
+            new_q = _text_quality(text)
+            old_q = _text_quality(existing)
+            if new_q > old_q:
+                info[field] = text
+            elif new_q == old_q and len(text) < len(existing):
+                info[field] = text
+
+    def field_is_empty(self, truck_track_id: int, field: str) -> bool:
+        """Return True if the truck exists and the field hasn't been filled yet."""
+        with self._lock:
+            rec = self.trucks.get(truck_track_id)
+            if rec is None:
+                return False
+            return not rec["associated_info"].get(field)
+
+    def find_truck_for_field(self, field: str) -> int | None:
+        with self._lock:
+            best_tid: int | None = None
+            best_frame: int = -1
+            for tid, rec in self.trucks.items():
+                info = rec["associated_info"]
+                if field not in info:
+                    continue
+                existing = info.get(field) or ""
+                last_f   = rec.get("last_seen_frame", 0)
+                if not existing and last_f > best_frame:
+                    best_frame = last_f
+                    best_tid   = tid
+            if best_tid is None:
+                for tid, rec in self.trucks.items():
+                    info   = rec["associated_info"]
+                    last_f = rec.get("last_seen_frame", 0)
+                    if field in info and last_f > best_frame:
+                        best_frame = last_f
+                        best_tid   = tid
+            return best_tid
+
     def to_dict(self, session_info: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._lock:
             trucks_out: dict[str, dict[str, Any]] = {}
@@ -283,19 +436,19 @@ class TruckRegistry:
                 clean = {k: v for k, v in rec.items() if not k.startswith("_")}
                 clean["associated_info"] = dict(rec["associated_info"])
                 trucks_out[str(tid)] = clean
-        twc = sum(1 for t in trucks_out.values() if t["type"] == "truck_with_container")
+        twc  = sum(1 for t in trucks_out.values() if t["type"] == "truck_with_container")
         twoc = sum(1 for t in trucks_out.values() if t["type"] == "truck_without_container")
         return {
             "session": session_info or {},
             "summary": {
-                "total_trucks_tracked": len(trucks_out),
-                "trucks_with_container": twc,
+                "total_trucks_tracked":    len(trucks_out),
+                "trucks_with_container":   twc,
                 "trucks_without_container": twoc,
             },
             "trucks": trucks_out,
         }
- 
- 
+
+
 # ========================= OCR HELPERS =======================================
 def _parse_mineru_markdown(md_text: str) -> str:
     details = re.findall(
@@ -315,8 +468,8 @@ def _parse_mineru_markdown(md_text: str) -> str:
         and not re.match(r"^<[^>]+>$", line.strip())
     ]
     return " ".join(lines).strip()
- 
- 
+
+
 def _extract_md_from_zip(zip_url: str) -> str:
     try:
         resp = requests.get(zip_url, timeout=60)
@@ -330,8 +483,8 @@ def _extract_md_from_zip(zip_url: str) -> str:
     except Exception:
         return ""
     return ""
- 
- 
+
+
 def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
     if not MINERU_TOKEN:
         return ""
@@ -341,8 +494,8 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
     }
     _, enc = cv2.imencode(".png", crop_rgb)
     filename = f"crop_{uuid.uuid4().hex[:8]}.png"
-    data_id = uuid.uuid4().hex
- 
+    data_id  = uuid.uuid4().hex
+
     for attempt in range(max_retries):
         try:
             step1 = requests.post(
@@ -359,14 +512,14 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
             if payload.get("code") != 0:
                 print(f"  ⚠️ MinerU: {payload.get('msg')}")
                 continue
-            batch_id = payload["data"]["batch_id"]
+            batch_id   = payload["data"]["batch_id"]
             upload_url = payload["data"]["file_urls"][0]
- 
+
             put_resp = requests.put(upload_url, data=enc.tobytes(), timeout=30)
             if put_resp.status_code not in (200, 201):
                 print(f"  ⚠️ Upload failed: {put_resp.status_code}")
                 continue
- 
+
             poll_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
             for poll_i in range(20):
                 time.sleep(3)
@@ -389,15 +542,15 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
                     print(f"  ⚠️ Poll #{poll_i} error: {e}")
                     continue
             print(f"  ⚠️ MinerU: max polls reached (attempt {attempt + 1})")
- 
+
         except requests.exceptions.Timeout:
             print(f"  ⚠️ MinerU S1/S2 timeout (attempt {attempt + 1}/{max_retries})")
         except requests.exceptions.RequestException as e:
             print(f"  ⚠️ MinerU request error: {e} (attempt {attempt + 1}/{max_retries})")
- 
+
     return ""
- 
- 
+
+
 # ========================= VISUAL HELPERS ====================================
 def _resize_for_inference(frame: np.ndarray) -> tuple[np.ndarray, float]:
     h, w = frame.shape[:2]
@@ -405,10 +558,9 @@ def _resize_for_inference(frame: np.ndarray) -> tuple[np.ndarray, float]:
         return frame, 1.0
     scale = INFER_WIDTH / w
     return cv2.resize(frame, (INFER_WIDTH, int(h * scale)), interpolation=cv2.INTER_LINEAR), scale
- 
- 
+
+
 def _preprocess_crop(crop_bgr: np.ndarray) -> np.ndarray:
-    """Upscale tiny crops + convert to RGB — identical to snippet 2."""
     h, w = crop_bgr.shape[:2]
     if h < 64:
         crop_bgr = cv2.resize(
@@ -417,37 +569,28 @@ def _preprocess_crop(crop_bgr: np.ndarray) -> np.ndarray:
             interpolation=cv2.INTER_CUBIC,
         )
     return cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
- 
- 
+
+
 def _annotate_frame(
     frame: np.ndarray,
     boxes_data: list[tuple],
     assoc_map: dict[int, tuple[int, str, str]],
     ocr_map: dict[int, str],
     pending_track_ids: set[int],
+    job: VideoJob | None = None,
 ) -> np.ndarray:
-    """
-    Annotation logic ported exactly from snippet 2 / annotate_frame():
-      • Per-class PALETTE colour (not a single fixed colour)
-      • Filled segmentation mask  +  contour outline on top
-      • Filled label background rectangle so text is always readable
-      • OCR text with black shadow (double putText) for readability
-      • HUD progress bar at bottom of frame
-    """
     H, W = frame.shape[:2]
- 
+
     for i, (x1, y1, x2, y2, cls_id, conf_val, tid_raw, mask) in enumerate(boxes_data):
         cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
         colour   = PALETTE.get(cls_id, (88, 170, 255))
         tid_str  = f"#{tid_raw} " if tid_raw is not None else ""
- 
-        # ── Segmentation mask fill + contour outline ──────────────────────────
+
         if mask is not None:
-            m = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
+            m  = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
             ov = frame.copy()
             ov[m > 0.5] = colour
             cv2.addWeighted(ov, MASK_ALPHA, frame, 1 - MASK_ALPHA, 0, frame)
-            # ← contour outline (missing in old snippet 1)
             ctrs, _ = cv2.findContours(
                 (m > 0.5).astype(np.uint8),
                 cv2.RETR_EXTERNAL,
@@ -456,13 +599,20 @@ def _annotate_frame(
             cv2.drawContours(frame, ctrs, -1, colour, 2)
         else:
             cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
- 
-        # ── Label with filled background rectangle ────────────────────────────
+
+        # ── Label: show lock status (from snippet 1) ───────────────────────────
         label = f"{tid_str}{cls_name} {conf_val:.2f}"
-        if i in assoc_map:
+        if tid_raw is not None and cls_name in CHILD_CLASSES and job is not None:
+            if tid_raw in job.child_to_truck:
+                link = job.child_to_truck[tid_raw]
+                label += f"  🔒→T#{link['truck_tid']}"
+            elif tid_raw in job.child_assoc_votes:
+                vote = job.child_assoc_votes[tid_raw]
+                label += f"  ⏳{vote['count']}/{LOCK_AFTER_N_FRAMES}→T#{vote['truck_tid']}"
+        elif i in assoc_map:
             truck_tid, _truck_type, _field = assoc_map[i]
             label += f"  →T#{truck_tid}"
- 
+
         (lw, lh), bl = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
         cv2.rectangle(frame, (x1, max(0, y1 - lh - bl - 4)), (x1 + lw, y1), colour, -1)
         cv2.putText(
@@ -470,8 +620,7 @@ def _annotate_frame(
             (x1, max(lh, y1 - bl - 2)),
             cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA,
         )
- 
-        # ── OCR overlay with black shadow ─────────────────────────────────────
+
         if cls_name in OCR_CLASSES:
             if i in ocr_map and ocr_map[i]:
                 txt   = ocr_map[i][:60]
@@ -481,26 +630,37 @@ def _annotate_frame(
                 color = (200, 200, 50)
             else:
                 continue
- 
+
             txt_y = y2 + 22 if y2 + 42 < H else max(20, y1 - 10)
-            # shadow
             cv2.putText(
                 frame, txt, (x1 + 1, txt_y + 1),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3, cv2.LINE_AA,
             )
-            # foreground
             cv2.putText(
                 frame, txt, (x1, txt_y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA,
             )
- 
+
     return frame
- 
- 
-def _det_key(track_id: int | None, frame_id: int, det_idx: int) -> str:
+
+
+def _det_key(
+    track_id: int | None,
+    frame_id: int,
+    det_idx: int,
+    truck_tid: int | None = None,
+    field: str | None = None,
+) -> str:
+    """
+    Truck-field-scoped OCR key.
+    When we know which truck and which field this crop belongs to, scope the
+    key to (truck_tid, field) rather than the child's track_id.
+    """
+    if truck_tid is not None and field is not None:
+        return f"truck_{truck_tid}_{field}"
     return f"t{track_id}" if track_id is not None else f"f{frame_id}_i{det_idx}"
- 
- 
+
+
 def _enqueue_ocr(
     job_id: str,
     key: str,
@@ -509,6 +669,7 @@ def _enqueue_ocr(
     frame_id: int,
     truck_tid: int | None,
     truck_type: str | None,
+    child_track_id: int | None = None,
 ) -> None:
     with _jobs_lock:
         job = JOBS.get(job_id)
@@ -516,56 +677,90 @@ def _enqueue_ocr(
             return
         job.submitted_keys.add(key)
         job.pending_keys.add(key)
-    _ocr_queue.put((job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type))
- 
- 
+    _ocr_queue.put((job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id))
+
+
 def _ocr_worker() -> None:
     while True:
         item = _ocr_queue.get()
         if item is None:
             break
-        job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type = item
-        print(f"  [OCR] key={key}  field={field}  truck=T#{truck_tid}")
-        text = _call_mineru_ocr(crop_rgb)
+        job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id = item
+        
         with _jobs_lock:
             job = JOBS.get(job_id)
             if job is None:
                 _ocr_queue.task_done()
                 continue
+            
+            # ── Look up permanent locked association if available ──────────────────
+            if child_track_id is not None and child_track_id in job.child_to_truck:
+                lock = job.child_to_truck[child_track_id]
+                truck_tid = lock["truck_tid"]
+                truck_type = lock["truck_type"]
+                field = lock["field"]
+                print(f"  [OCR] using LOCKED association: child T#{child_track_id} → T#{truck_tid}")
+        
+        # Perform OCR outside lock
+        text = _call_mineru_ocr(crop_rgb)
+        
+        with _jobs_lock:
+            job = JOBS.get(job_id)
+            if job is None:
+                _ocr_queue.task_done()
+                continue
+            
             job.pending_keys.discard(key)
             if text:
                 job.ocr_cache[key] = text
                 log = f"[f{frame_id}] {field} → '{text}'"
-                if truck_tid is not None:
-                    log += f"  (T#{truck_tid})"
+
+                resolved_tid = truck_tid
+                resolved_type = truck_type or ""
+
+                if job.registry is not None:
+                    if resolved_tid is not None:
+                        job.registry.attach_ocr(resolved_tid, resolved_type, field, text)
+                        log += f"  (T#{resolved_tid})"
+                    else:
+                        candidate = job.registry.find_truck_for_field(field)
+                        if candidate is not None:
+                            resolved_tid = candidate
+                            rec = job.registry.trucks.get(candidate)
+                            resolved_type = rec["type"] if rec else ""
+                            job.registry.attach_ocr(resolved_tid, resolved_type, field, text)
+                            log += f"  (orphan → T#{resolved_tid})"
+                            print(f"  [OCR] ↩ orphan '{field}' rescued → T#{resolved_tid}")
+                        else:
+                            log += "  (orphan — no compatible truck yet)"
+                            print(f"  [OCR] ⚠ orphan '{field}' — no compatible truck, dropping")
+                
                 job.ocr_log.append(log)
                 job.ocr_log = job.ocr_log[-60:]
-                if job.registry is not None and truck_tid is not None:
-                    # ← pass truck_type so attach_ocr can enforce field ownership
-                    job.registry.attach_ocr(truck_tid, truck_type or "", field, text)
                 print(f"  [OCR] ✓ {key} → '{text}'")
             else:
-                # allow retry on next frame occurrence
+                # Empty result — remove from submitted so retry is possible
                 job.submitted_keys.discard(key)
                 print(f"  [OCR] ✗ {key} — will retry")
+        
         _ocr_queue.task_done()
- 
- 
+
+
 for _ in range(OCR_WORKERS):
     threading.Thread(target=_ocr_worker, daemon=True).start()
- 
- 
+
+
 # ========================= PROCESSING ========================================
 def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[str, Any]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("Could not open video file.")
- 
+
     fps          = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w_orig       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h_orig       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
- 
+
     session_info: dict[str, Any] = {
         "video_path":   video_path,
         "total_frames": total_frames,
@@ -574,53 +769,60 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         "started_at":   datetime.now().isoformat(timespec="seconds"),
         "device":       DEVICE,
         "model":        MODEL_PATH,
+        "lock_after_n_frames": LOCK_AFTER_N_FRAMES,  # Record locking config
     }
- 
+
     registry = TruckRegistry(fps=fps)
     if job is not None:
         _set_job(job.job_id, registry=registry, session_info=session_info, total_frames=total_frames)
- 
+
     frame_id   = 0
     t_prev     = time.time()
     fps_smooth = 0.0
- 
+
     while True:
         ret, frame_orig = cap.read()
         if not ret:
             break
- 
-        # ── Frame-skip: keep tracker alive but skip annotation ────────────────
+
+        # ── Frame-skip ────────────────────────────────────────────────────────
         if FRAME_SKIP > 0 and frame_id % (FRAME_SKIP + 1) != 0:
             small, _ = _resize_for_inference(frame_orig)
-            model.track(
-                small, conf=CONF, iou=IOU_THRESH,
-                tracker="bytetrack.yaml", persist=True,
-                verbose=False, half=USE_HALF, device=DEVICE,
-            )
+            try:
+                model.track(
+                    small, conf=CONF, iou=IOU_THRESH,
+                    tracker="bytetrack.yaml", persist=True,
+                    verbose=False, half=USE_HALF, device=DEVICE,
+                )
+            except Exception:
+                pass
             frame_id += 1
             continue
- 
+
         # ── Inference ─────────────────────────────────────────────────────────
         frame_small, scale = _resize_for_inference(frame_orig)
         t0      = time.time()
-        results = model.track(
-            frame_small,
-            conf=CONF,
-            iou=IOU_THRESH,
-            tracker="bytetrack.yaml",
-            persist=True,
-            verbose=False,
-            half=USE_HALF,
-            device=DEVICE,
-        )
+        try:
+            results = model.track(
+                frame_small,
+                conf=CONF,
+                iou=IOU_THRESH,
+                tracker="bytetrack.yaml",
+                persist=True,
+                verbose=False,
+                half=USE_HALF,
+                device=DEVICE,
+            )
+        except Exception:
+            results = None
         infer_ms = (time.time() - t0) * 1000
- 
+
         boxes_data: list[tuple] = []
         ocr_map:    dict[int, str] = {}
- 
+
         boxes_raw = results[0].boxes if results else None
         masks_raw = results[0].masks if results else None
- 
+
         if boxes_raw is not None and len(boxes_raw) > 0:
             for i, box in enumerate(boxes_raw):
                 sx1, sy1, sx2, sy2 = map(int, box.xyxy[0].tolist())
@@ -630,28 +832,50 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                 y2 = min(h_orig, int(sy2 / scale))
                 if x2 <= x1 or y2 <= y1:
                     continue
- 
+
                 cls_id   = int(box.cls[0])
                 conf_val = float(box.conf[0])
                 cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
                 track_id = int(box.id[0]) if box.id is not None else None
- 
-                # ── Per-class confidence gate (trucks need ≥ TRUCK_CONF_THRESH) ──
-                if cls_name in TRUCK_CLASSES and conf_val < TRUCK_CONF_THRESH:
-                    continue
- 
-                mask = (
-                    masks_raw.data[i].cpu().numpy()
-                    if masks_raw is not None and i < len(masks_raw.data)
-                    else None
-                )
+
+                # Per-class confidence gates
+                if cls_name in TRUCK_CLASSES:
+                    if conf_val < TRUCK_CONF_THRESH:
+                        continue
+                    truck_area = (x2 - x1) * (y2 - y1)
+                    if truck_area < MIN_TRUCK_AREA:
+                        print(f"  [AREA] drop {cls_name} area={truck_area} < {MIN_TRUCK_AREA}")
+                        continue
+
+                if cls_name in TRUCK_CLASSES and masks_raw is not None and i < len(masks_raw.data):
+                    mask = masks_raw.data[i].cpu().numpy()
+                else:
+                    mask = None
+
                 boxes_data.append((x1, y1, x2, y2, cls_id, conf_val, track_id, mask))
- 
+
+                # Register truck in registry
                 if cls_name in TRUCK_CLASSES and track_id is not None:
                     registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val)
- 
-        assoc_map = _build_association_map(boxes_data)  # {det_idx → (ttid, ttype, field)}
- 
+
+        # ── Spatial association with locking (from snippet 1) ───────────────────
+        assoc_map = _build_association_map_integrated(boxes_data, job if job is not None else None)
+
+        # ── Periodic retry for empty truck fields ───────────────────────────────
+        if job is not None and frame_id % OCR_RETRY_EVERY == 0 and frame_id > 0:
+            with _jobs_lock:
+                for i, (x1, y1, x2, y2, cls_id, _conf, track_id, _mask) in enumerate(boxes_data):
+                    cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
+                    if cls_name not in OCR_CLASSES or i not in assoc_map:
+                        continue
+                    truck_tid, truck_type, fld = assoc_map[i]
+                    if registry.field_is_empty(truck_tid, fld):
+                        retry_key = _det_key(track_id, frame_id, i, truck_tid, fld)
+                        if retry_key in job.submitted_keys:
+                            job.submitted_keys.discard(retry_key)
+                            job.pending_keys.discard(retry_key)
+                            print(f"  [RETRY] f{frame_id} T#{truck_tid} field='{fld}' unlocked for re-submission")
+
         # ── Snapshot current OCR state from the job ───────────────────────────
         if job is not None:
             with _jobs_lock:
@@ -660,46 +884,65 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                 pending   = set(job.pending_keys)
         else:
             submitted, cached, pending = set(), {}, set()
- 
-        # ── Build ocr_map + enqueue new crops ────────────────────────────────
-        for i, (x1, y1, x2, y2, cls_id, _conf, track_id, _mask) in enumerate(boxes_data):
+
+        # ── Build ocr_map + enqueue new crops with best-confidence tracking ────
+        for i, (x1, y1, x2, y2, cls_id, conf_val, track_id, _mask) in enumerate(boxes_data):
             cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
             if cls_name not in OCR_CLASSES:
                 continue
- 
+
             crop_bgr = frame_orig[y1:y2, x1:x2].copy()
             if crop_bgr.size == 0:
                 continue
- 
+
             if SAVE_CROPS:
                 cv2.imwrite(
                     os.path.join(OUTPUT_DIR, "ocr_crops", f"f{frame_id:05d}_i{i}_{cls_name}.jpg"),
                     crop_bgr,
                 )
- 
-            key = _det_key(track_id, frame_id, i)
-            if key in cached:
-                ocr_map[i] = cached[key]
- 
-            # determine parent truck
+
+            # ── Resolve truck association for this detection ───────────────────
             truck_tid, truck_type, field = None, None, cls_name
             if i in assoc_map:
                 truck_tid, truck_type, field = assoc_map[i]
- 
-            should_submit = key not in pending and key not in submitted
+
+            # Use truck-field-scoped key when we have a truck association
+            key = _det_key(track_id, frame_id, i, truck_tid, field)
+
+            if key in cached:
+                ocr_map[i] = cached[key]
+
+            # Best-confidence tracking: only queue if confidence improved
+            should_submit = False
+            if key not in pending and key not in submitted and job is not None:
+                best_key = (cls_name, track_id) if track_id is not None else None
+                if best_key:
+                    with _jobs_lock:
+                        prev_best = job.ocr_best_conf.get(best_key, 0.0)
+                        if conf_val > prev_best:
+                            job.ocr_best_conf[best_key] = conf_val
+                            # Remove old pending/submitted for this key
+                            job.submitted_keys.discard(key)
+                            job.pending_keys.discard(key)
+                            should_submit = True
+                            print(f"  [OCR-BEST] {cls_name} T#{track_id} conf={conf_val:.3f} > prev={prev_best:.3f}")
+                else:
+                    should_submit = True
+
             if should_submit and job is not None:
                 _enqueue_ocr(
                     job.job_id, key,
                     _preprocess_crop(crop_bgr),
                     field, frame_id, truck_tid, truck_type,
+                    track_id,  # Pass child track_id for lock lookup
                 )
- 
+
         # ── pending_track_ids for "scanning…" overlay ─────────────────────────
         pending_track_ids: set[int] = {
             int(k[1:]) for k in pending if k.startswith("t") and k[1:].isdigit()
         }
- 
-        # ── Gather HUD numbers ────────────────────────────────────────────────
+
+        # ── Gather HUD numbers including locking stats ────────────────────────
         n_cache   = len(cached)
         n_pending = len(pending)
         q_size    = _ocr_queue.qsize()
@@ -709,13 +952,16 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             f"GPU: {torch.cuda.memory_allocated() // 1024**2} MB"
             if DEVICE == "cuda" else "CPU mode"
         )
- 
-        # ── Annotate (exact snippet-2 style) ─────────────────────────────────
+        
+        # Get locking stats from job
+        n_locked = len(job.child_to_truck) if job else 0
+        n_voting = len(job.child_assoc_votes) if job else 0
+
+        # ── Annotate ──────────────────────────────────────────────────────────
         annotated = _annotate_frame(
-            frame_orig.copy(), boxes_data, assoc_map, ocr_map, pending_track_ids
+            frame_orig.copy(), boxes_data, assoc_map, ocr_map, pending_track_ids, job
         )
- 
-        # ── HUD text overlay (identical to snippet 2) ─────────────────────────
+
         cv2.putText(
             annotated,
             f"Frame {frame_id}/{total_frames} ({pct}%)  |  {fps_smooth:.1f} FPS  |  {infer_ms:.0f} ms",
@@ -727,22 +973,24 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             f"queue: {q_size}  |  {gpu_txt}",
             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 255, 180), 1, cv2.LINE_AA,
         )
- 
-        # ── Progress bar at bottom (identical to snippet 2) ───────────────────
+        cv2.putText(
+            annotated,
+            f"Assoc locked: {n_locked}  voting: {n_voting}",
+            (10, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 100), 1, cv2.LINE_AA,
+        )
+
         bar_w = int(w_orig * frame_id / total_frames) if total_frames > 0 else 0
         cv2.rectangle(annotated, (0, h_orig - 8), (w_orig, h_orig), (40, 40, 40), -1)
         cv2.rectangle(annotated, (0, h_orig - 8), (bar_w,  h_orig), (0, 220, 100), -1)
- 
-        # ── Encode & push JPEG to job ─────────────────────────────────────────
+
         ok, jpeg = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if ok and job is not None:
             _set_job(job.job_id, latest_frame_jpeg=jpeg.tobytes())
- 
-        # ── FPS smoothing ─────────────────────────────────────────────────────
+
         t_now      = time.time()
         fps_smooth = 0.8 * fps_smooth + 0.2 * (1.0 / max(t_now - t_prev, 1e-6))
         t_prev     = t_now
- 
+
         frame_id += 1
         if job is not None:
             progress = (frame_id / total_frames) if total_frames > 0 else 0.0
@@ -753,7 +1001,8 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                 fps=round(fps_smooth, 2),
                 message=(
                     f"Processing frame {frame_id}/{total_frames}  |  "
-                    f"OCR done: {n_cache}  pending: {n_pending}  queue: {q_size}"
+                    f"OCR done: {n_cache}  pending: {n_pending}  queue: {q_size}  |  "
+                    f"Locked: {n_locked}  Voting: {n_voting}"
                 ),
             )
             if frame_id % JSON_SNAP_EVERY == 0:
@@ -761,7 +1010,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     job.job_id,
                     json_snapshot=json.dumps(registry.to_dict(session_info), indent=2),
                 )
- 
+
     cap.release()
     session_info["finished_at"]      = datetime.now().isoformat(timespec="seconds")
     session_info["frames_processed"] = frame_id
@@ -769,17 +1018,17 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
     if job is not None:
         _set_job(job.job_id, json_snapshot=json.dumps(final_data, indent=2))
     return final_data
- 
- 
+
+
 def _run_job(job_id: str) -> None:
     with _jobs_lock:
         job        = JOBS[job_id]
         video_path = job.temp_video_path
- 
+
     if not video_path:
         _set_job(job_id, state="failed", error="Missing temp video path", message="Job failed.")
         return
- 
+
     try:
         _set_job(job_id, state="running", message="Video processing started.")
         result = _run_video_analysis(video_path, job=job)
@@ -791,8 +1040,8 @@ def _run_job(job_id: str) -> None:
             os.remove(video_path)
         except OSError:
             pass
- 
- 
+
+
 # ========================= ENDPOINTS =========================================
 @app.post("/infer")
 async def infer(file: UploadFile = File(...)) -> dict[str, Any]:
@@ -807,20 +1056,25 @@ async def infer(file: UploadFile = File(...)) -> dict[str, Any]:
         if results:
             names = results[0].names or {}
             for box in results[0].boxes:
-                xyxy   = box.xyxy[0].tolist()
-                cls_id = int(box.cls[0].item()) if box.cls is not None else -1
-                conf   = float(box.conf[0].item()) if box.conf is not None else 0.0
+                xyxy     = box.xyxy[0].tolist()
+                cls_id   = int(box.cls[0].item()) if box.cls is not None else -1
+                conf_val = float(box.conf[0].item()) if box.conf is not None else 0.0
+                cls_name = names.get(cls_id, f"class_{cls_id}")
+
+                if cls_name in TRUCK_CLASSES and conf_val < TRUCK_CONF_THRESH:
+                    continue
+
                 detections.append({
-                    "plate_text": names.get(cls_id, f"class_{cls_id}"),
-                    "confidence": round(conf, 4),
+                    "plate_text": cls_name,
+                    "confidence": round(conf_val, 4),
                     "bbox": {
                         "x1": round(xyxy[0], 2), "y1": round(xyxy[1], 2),
                         "x2": round(xyxy[2], 2), "y2": round(xyxy[3], 2),
                     },
                 })
     return {"detections": detections, "filename": file.filename}
- 
- 
+
+
 @app.post("/analyze-video")
 async def analyze_video(file: UploadFile = File(...)) -> dict[str, Any]:
     raw = await file.read()
@@ -830,19 +1084,19 @@ async def analyze_video(file: UploadFile = File(...)) -> dict[str, Any]:
         path = Path(tmp_dir) / (file.filename or "upload.mp4")
         path.write_bytes(raw)
         return _run_video_analysis(str(path), job=None)
- 
- 
+
+
 @app.post("/analyze-video/start")
 async def analyze_video_start(file: UploadFile = File(...)) -> dict[str, Any]:
     raw = await file.read()
     if not raw:
         raise HTTPException(status_code=400, detail="Empty video upload.")
- 
+
     job_id     = uuid.uuid4().hex
     tmp_dir    = tempfile.mkdtemp(prefix="plateflow_job_")
     video_path = Path(tmp_dir) / (file.filename or "upload.mp4")
     video_path.write_bytes(raw)
- 
+
     with _jobs_lock:
         JOBS[job_id] = VideoJob(
             job_id=job_id,
@@ -852,8 +1106,8 @@ async def analyze_video_start(file: UploadFile = File(...)) -> dict[str, Any]:
         )
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
     return {"job_id": job_id, "state": "queued", "message": "Video job created."}
- 
- 
+
+
 @app.get("/analyze-video/jobs/{job_id}")
 def analyze_video_job_status(job_id: str) -> dict[str, Any]:
     with _jobs_lock:
@@ -872,8 +1126,8 @@ def analyze_video_job_status(job_id: str) -> dict[str, Any]:
         "ocr_log":       job.ocr_log[-20:],
         "json_snapshot": job.json_snapshot,
     }
- 
- 
+
+
 @app.get("/analyze-video/jobs/{job_id}/result")
 def analyze_video_job_result(job_id: str) -> dict[str, Any]:
     with _jobs_lock:
@@ -885,8 +1139,8 @@ def analyze_video_job_result(job_id: str) -> dict[str, Any]:
     if job.state != "completed" or job.result is None:
         raise HTTPException(status_code=409, detail="Job is not completed yet.")
     return {"job_id": job.job_id, "state": job.state, "result": job.result}
- 
- 
+
+
 @app.get("/analyze-video/jobs/{job_id}/frame")
 def analyze_video_job_frame(job_id: str) -> Response:
     with _jobs_lock:
@@ -896,8 +1150,8 @@ def analyze_video_job_frame(job_id: str) -> Response:
     if not job.latest_frame_jpeg:
         raise HTTPException(status_code=404, detail="No frame available yet.")
     return Response(content=job.latest_frame_jpeg, media_type="image/jpeg")
- 
- 
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
