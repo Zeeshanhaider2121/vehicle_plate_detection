@@ -36,6 +36,10 @@ app = FastAPI(title=settings.app_name, version="0.1.0")
 inference_service = InferenceService()
 video_client = ColabVideoClient()
 
+# Cache the last known good snapshot per job so the frontend
+# still gets data even after the Colab stub crashes.
+_last_good_snapshot: dict[str, str] = {}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list or ["*"],
@@ -342,10 +346,38 @@ async def start_video_job(
 def get_video_job_status(job_id: str) -> VideoAnalyzeStatusResponse:
     if not video_client.configured():
         raise HTTPException(status_code=400, detail="COLAB_INFER_URL is not configured.")
+
+    # Try fetching from the Colab stub; if it fails, return the last known good snapshot.
     try:
         data = video_client.get_video_job_status(job_id)
-    except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=502, detail=f"Failed to fetch job status: {exc}") from exc
+    except Exception:  # pragma: no cover
+        cached = _last_good_snapshot.get(job_id)
+        if cached:
+            return VideoAnalyzeStatusResponse(
+                job_id=job_id,
+                state="cached",
+                progress=None,
+                json_snapshot=cached,
+                ocr_log=[],
+            )
+        raise HTTPException(status_code=502, detail="Colab stub is unavailable and no cached snapshot exists.")
+
+    snap = data.get("json_snapshot")
+    ocr = data.get("ocr_log") or []
+    if snap and len(snap) > 50:
+        _last_good_snapshot[job_id] = snap
+        import json as _json
+        try:
+            snap_path = f"colab_log_{job_id[:8]}_snapshot.json"
+            with open(snap_path, "w") as f:
+                parsed = _json.loads(snap)
+                _json.dump(parsed, f, indent=2, default=str)
+            print(f"  [JSON LOG] Wrote snapshot → {snap_path}")
+        except Exception as e:
+            print(f"  [JSON LOG] Failed to write snapshot: {e}")
+    if ocr:
+        for line in ocr[-3:]:
+            print(f"  [OCR LOG] {line}")
 
     return VideoAnalyzeStatusResponse(
         job_id=job_id,
@@ -369,6 +401,14 @@ def finalize_video_job(job_id: str, db: Session = Depends(get_db)) -> VideoAnaly
         data = video_client.get_video_job_result(job_id)
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=502, detail=f"Failed to fetch job result: {exc}") from exc
+
+    import json as _json
+    final_path = f"colab_log_{job_id[:8]}_final.json"
+    with open(final_path, "w") as f:
+        _json.dump(data, f, indent=2, default=str)
+    print(f"\n{'#'*70}")
+    print(f"### RAW COLAB FINALIZE RESPONSE → {final_path} ###")
+    print(f"{'#'*70}")
 
     payload_dict = data.get("result", data)
     try:
