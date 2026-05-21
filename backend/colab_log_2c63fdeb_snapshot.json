@@ -1,0 +1,208 @@
+{
+  "session": {
+    "video_path": "/tmp/plateflow_job_tstxgn6w/in-lane-3-back-zoom-nvr-20260429104732-20260429114529-1999865_UnbMQ8Jc (1).mp4",
+    "total_frames": 10376,
+    "video_fps": 30.0,
+    "resolution": "1280x720",
+    "started_at": "2026-05-21T19:39:52",
+    "device": "cuda",
+    "model": "/content/drive/MyDrive/vehicle_plate/output/runs/yolo26x_seg_phase2/weights/best.pt",
+    "lock_after_n_frames": 5
+  },
+  "summary": {
+    "total_trucks_tracked": 7,
+    "trucks_with_container": 5,
+    "trucks_without_container": 2
+  },
+  "trucks": {
+    "1": {
+      "track_id": 1,
+      "type": "truck_without_container",
+      "first_seen_frame": 0,
+      "last_seen_frame": 1755,
+      "first_seen_time_sec": 0.0,
+      "last_seen_time_sec": 58.5,
+      "duration_frames": 1756,
+      "duration_sec": 58.533,
+      "confidence_avg": 0.9631,
+      "last_bbox": [
+        909,
+        112,
+        1104,
+        353
+      ],
+      "associated_info": {
+        "license_plate": {
+          "text": "# AC6-64J",
+          "confidence": 0.4727
+        },
+        "truck_company": {
+          "text": "IN",
+          "confidence": 0.3364
+        },
+        "truck_number": null
+      }
+    },
+    "34": {
+      "track_id": 34,
+      "type": "truck_with_container",
+      "first_seen_frame": 232,
+      "last_seen_frame": 1965,
+      "first_seen_time_sec": 7.733,
+      "last_seen_time_sec": 65.5,
+      "duration_frames": 1734,
+      "duration_sec": 57.8,
+      "confidence_avg": 0.9544,
+      "last_bbox": [
+        225,
+        88,
+        808,
+        398
+      ],
+      "associated_info": {
+        "container_number": {
+          "text": "c 33",
+          "confidence": 0.6479
+        },
+        "container_side_no": null,
+        "container_company_logo": {
+          "text": "# MAERSK",
+          "confidence": 0.9175
+        },
+        "other_container_info": null
+      }
+    },
+    "53": {
+      "track_id": 53,
+      "type": "truck_with_container",
+      "first_seen_frame": 290,
+      "last_seen_frame": 290,
+      "first_seen_time_sec": 9.667,
+      "last_seen_time_sec": 9.667,
+      "duration_frames": 1,
+      "duration_sec": 0.033,
+      "confidence_avg": 0.9639,
+      "last_bbox": [
+        2,
+        84,
+        733,
+        701
+      ],
+      "associated_info": {
+        "container_number": {
+          "text": "%",
+          "confidence": 0.7646
+        },
+        "container_side_no": null,
+        "container_company_logo": {
+          "text": "Cropped image showing partial text and symbols, possibly from a document or label",
+          "confidence": 0.2629
+        },
+        "other_container_info": null
+      }
+    },
+    "233": {
+      "track_id": 233,
+      "type": "truck_without_container",
+      "first_seen_frame": 1947,
+      "last_seen_frame": 2267,
+      "first_seen_time_sec": 64.9,
+      "last_seen_time_sec": 75.567,
+      "duration_frames": 321,
+      "duration_sec": 10.7,
+      "confidence_avg": 0.9471,
+      "last_bbox": [
+        152,
+        0,
+        1121,
+        718
+      ],
+      "associated_info": {
+        "license_plate": null,
+        "truck_company": {
+          "text": "# CARMEL",
+          "confidence": 0.9111
+        },
+        "truck_number": {
+          "text": "# 5267",
+          "confidence": 0.9351
+        }
+      }
+    },
+    "577": {
+      "track_id": 577,
+      "type": "truck_with_container",
+      "first_seen_frame": 6575,
+      "last_seen_frame": 6809,
+      "first_seen_time_sec": 219.167,
+      "last_seen_time_sec": 226.967,
+      "duration_frames": 235,
+      "duration_sec": 7.833,
+      "confidence_avg": 0.9734,
+      "last_bbox": [
+        909,
+        72,
+        1100,
+        309
+      ],
+      "associated_info": {
+        "container_number": {
+          "text": "# 99",
+          "confidence": 0.3242
+        },
+        "container_side_no": null,
+        "container_company_logo": {
+          "text": "# CAI",
+          "confidence": 0.9463
+        },
+        "other_container_info": null
+      }
+    },
+    "710": {
+      "track_id": 710,
+      "type": "truck_with_container",
+      "first_seen_frame": 6634,
+      "last_seen_frame": 6638,
+      "first_seen_time_sec": 221.133,
+      "last_seen_time_sec": 221.267,
+      "duration_frames": 5,
+      "duration_sec": 0.167,
+      "confidence_avg": 0.9472,
+      "last_bbox": [
+        262,
+        0,
+        1088,
+        720
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": null,
+        "container_company_logo": null,
+        "other_container_info": null
+      }
+    },
+    "715": {
+      "track_id": 715,
+      "type": "truck_with_container",
+      "first_seen_frame": 6649,
+      "last_seen_frame": 6809,
+      "first_seen_time_sec": 221.633,
+      "last_seen_time_sec": 226.967,
+      "duration_frames": 161,
+      "duration_sec": 5.367,
+      "confidence_avg": 0.9617,
+      "last_bbox": [
+        410,
+        78,
+        890,
+        360
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": null,
+        "container_company_logo": null,
+        "other_container_info": null
+      }
+    }
+  }
+}

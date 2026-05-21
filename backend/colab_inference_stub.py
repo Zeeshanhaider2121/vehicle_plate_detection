@@ -953,21 +953,21 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             if key in cached:
                 ocr_map[i] = cached[key]
 
-            # Best-confidence tracking: only queue if confidence improved
+            # Best-confidence tracking: always use the highest-confidence crop per (cls, track_id).
+            # We check even when the key is already submitted so a better crop supersedes the old one.
             should_submit = False
-            if key not in pending and key not in submitted and job is not None:
+            if job is not None:
                 best_key = (cls_name, track_id) if track_id is not None else None
                 if best_key:
                     with _jobs_lock:
                         prev_best = job.ocr_best_conf.get(best_key, 0.0)
                         if conf_val > prev_best:
                             job.ocr_best_conf[best_key] = conf_val
-                            # Remove old pending/submitted for this key
                             job.submitted_keys.discard(key)
                             job.pending_keys.discard(key)
                             should_submit = True
                             print(f"  [OCR-BEST] {cls_name} T#{track_id} conf={conf_val:.3f} > prev={prev_best:.3f}")
-                else:
+                elif key not in pending and key not in submitted:
                     should_submit = True
 
             if should_submit and job is not None:

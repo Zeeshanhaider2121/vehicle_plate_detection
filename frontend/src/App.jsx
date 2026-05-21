@@ -29,6 +29,11 @@ function mergeInfo(existing, incoming) {
       result[key] = inc;
       continue;
     }
+    // Prefer higher-confidence OCR result when both are structured objects
+    if (typeof inc === "object" && typeof ext === "object" && inc.confidence != null && ext.confidence != null) {
+      if (inc.confidence > ext.confidence) result[key] = inc;
+      continue;
+    }
     if (isBlurry(inc) && !isBlurry(ext)) continue;
     if (!isBlurry(inc) && isBlurry(ext)) { result[key] = inc; continue; }
     if (String(inc).length < String(ext).length) result[key] = inc;
@@ -56,7 +61,7 @@ function readOcrFieldValue(value) {
 }
 
 function readOcrFieldConfidence(value) {
-  if (typeof value === "object" && value.confidence != null) return value.confidence;
+  if (value !== null && typeof value === "object" && value.confidence != null) return value.confidence;
   return null;
 }
 
@@ -77,9 +82,9 @@ function readTruckFields(truck) {
     const c = readOcrFieldConfidence(info[f]);
     fieldConfs[f] = c != null ? c.toFixed(3) : "—";
   }
-  // Calculate per-truck confidence: use min OCR confidence among filled fields
+  // Show max OCR confidence across filled fields — reflects the best crop selected per class
   const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
-  const minOcrConf = ocrConfs.length > 0 ? Math.min(...ocrConfs).toFixed(3) : "—";
+  const maxOcrConf = ocrConfs.length > 0 ? Math.max(...ocrConfs).toFixed(3) : "—";
 
   return {
     trackId: pickFirst(truck?.track_id),
@@ -91,7 +96,7 @@ function readTruckFields(truck) {
     truck_company: fieldTexts.truck_company,
     truck_number: fieldTexts.truck_number,
     confidence: pickFirst(truck?.confidence_avg),
-    ocr_confidence: minOcrConf,
+    ocr_confidence: maxOcrConf,
     durationSec: pickFirst(truck?.duration_sec),
     firstSeen: pickFirst(truck?.first_seen_time_sec),
     lastSeen: pickFirst(truck?.last_seen_time_sec),
