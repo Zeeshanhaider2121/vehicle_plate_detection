@@ -89,9 +89,15 @@
         701
       ],
       "associated_info": {
-        "container_number": null,
+        "container_number": {
+          "text": "%",
+          "confidence": 0.7646
+        },
         "container_side_no": null,
-        "container_company_logo": null,
+        "container_company_logo": {
+          "text": "# CAI",
+          "confidence": 0.8521
+        },
         "other_container_info": null
       }
     },
@@ -114,8 +120,8 @@
       "associated_info": {
         "license_plate": null,
         "truck_company": {
-          "text": "CARMEL POTANSPORT",
-          "confidence": 0.9424
+          "text": "CARMEL",
+          "confidence": 0.9663
         },
         "truck_number": {
           "text": "5267",

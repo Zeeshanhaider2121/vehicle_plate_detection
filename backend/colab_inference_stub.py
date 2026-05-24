@@ -95,13 +95,33 @@ if SAVE_CROPS:
 # ========================= APP + MODEL =======================================
 app = FastAPI(title="PlateFlow Colab GPU API", version="3.5.0")
 
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+def _select_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE   = _select_device()
 USE_HALF = USE_HALF if DEVICE == "cuda" else False
+print("=" * 72, flush=True)
+print(f"[PlateFlow] Loading model: {MODEL_PATH}", flush=True)
+print(f"[PlateFlow] Torch version: {torch.__version__}", flush=True)
+if DEVICE == "cuda":
+    print(f"[PlateFlow] GPU enabled: CUDA ({torch.cuda.get_device_name(0)})", flush=True)
+elif DEVICE == "mps":
+    print("[PlateFlow] GPU enabled: Apple Metal/MPS", flush=True)
+else:
+    print("[PlateFlow] GPU not available: running on CPU", flush=True)
+print(f"[PlateFlow] Inference device: {DEVICE} | half precision: {USE_HALF}", flush=True)
 model    = YOLO(MODEL_PATH)
 model.to(DEVICE)
 _dummy = np.zeros((640, 640, 3), dtype=np.uint8)
 model.predict(_dummy, verbose=False, half=USE_HALF, device=DEVICE)
 del _dummy
+print("[PlateFlow] Model loaded and warmup inference completed.", flush=True)
+print("=" * 72, flush=True)
 
 # ========================= DATA STRUCTS ======================================
 _jobs_lock = threading.Lock()
