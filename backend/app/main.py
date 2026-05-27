@@ -426,6 +426,7 @@ def _merge_truck_group(
     observations: list[dict[str, Any]],
     match_method: str | None = None,
     match_confidence: float | None = None,
+    camera_roles: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     first = observations[0]
     merged_info: dict[str, Any] = {key: None for key in OCR_FIELD_KEYS}
@@ -456,9 +457,6 @@ def _merge_truck_group(
         if truck.get("last_seen_time_sec") is not None:
             last_times.append(float(truck["last_seen_time_sec"]))
 
-        for field in OCR_FIELD_KEYS:
-            merged_info[field] = _better_field(merged_info.get(field), info.get(field))
-
         camera_observations.append(
             {
                 "entity_track_id": entity_id,
@@ -473,6 +471,20 @@ def _merge_truck_group(
                 "last_bbox": truck.get("last_bbox"),
             }
         )
+
+    # Camera-role-aware field merging.
+    # For each field, process authoritative-camera observations first so they win
+    # tiebreaks against equal-confidence reads from off-role cameras.
+    for field in OCR_FIELD_KEYS:
+        if camera_roles:
+            auth = [o for o in observations if field in (camera_roles.get(o["camera"]) or set())]
+            other = [o for o in observations if o not in auth]
+            ordered = auth + other
+        else:
+            ordered = observations
+        for obs in ordered:
+            info = obs["truck"].get("associated_info") or {}
+            merged_info[field] = _better_field(merged_info.get(field), info.get(field))
 
     field_validation = _build_field_validation(merged_info)
     invalid_fields = [
@@ -496,6 +508,7 @@ def _merge_truck_group(
         "needs_review": needs_review,
         "review_reason": "; ".join(review_reasons) if review_reasons else None,
         "identity_keys": identity_keys,
+        "camera_roles_applied": bool(camera_roles),
         "camera_count": len({obs["camera"] for obs in observations}),
         "camera_time_offsets_seconds": {
             obs["camera"]: obs["truck"].get("time_offset_sec", 0.0)
