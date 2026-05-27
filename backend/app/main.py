@@ -902,7 +902,11 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
         observations_by_camera.setdefault(obs["camera"], []).append(obs)
 
     group_specs: list[tuple[list[dict[str, Any]], str | None, float | None]]
-    if (
+    if MULTI_CAMERA_GATE_MODE:
+        # Gate setup: one vehicle at a time, all cameras see the same truck.
+        # Merge every observation regardless of per-camera count.
+        group_specs = [(observations, "gate_mode", 0.95)]
+    elif (
         MULTI_CAMERA_ASSUME_SINGLE_ENTITY
         and observations_by_camera
         and all(len(items) <= 1 for items in observations_by_camera.values())
@@ -949,8 +953,9 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             group_specs.extend(([obs], "single_camera_unmatched", 0.25) for obs in no_identity)
 
     trucks_out: dict[str, dict[str, Any]] = {}
+    _roles = MULTI_CAMERA_CAMERA_ROLES if MULTI_CAMERA_CAMERA_ROLES else None
     for index, (group, match_method, match_confidence) in enumerate(group_specs, start=1):
-        trucks_out[str(index)] = _merge_truck_group(index, group, match_method, match_confidence)
+        trucks_out[str(index)] = _merge_truck_group(index, group, match_method, match_confidence, _roles)
 
     with_container = sum(1 for truck in trucks_out.values() if truck["type"] == "truck_with_container")
     without_container = sum(1 for truck in trucks_out.values() if truck["type"] == "truck_without_container")
