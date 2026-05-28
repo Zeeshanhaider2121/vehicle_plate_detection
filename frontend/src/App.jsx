@@ -112,6 +112,15 @@ function shortText(value, max = 22) {
   return `${text.slice(0, Math.max(0, max - 3))}...`;
 }
 
+function formatTimeSec(sec) {
+  if (sec === null || sec === undefined || sec === "—") return "—";
+  const s = Number(sec);
+  if (isNaN(s)) return "—";
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60).toString().padStart(2, "0");
+  return `${m}:${ss}`;
+}
+
 function stripOcrMarkdown(value) {
   if (!value || typeof value !== "string") return value;
   // Remove markdown image ![alt](path)
@@ -201,11 +210,14 @@ export default function App() {
   const currentFields = useMemo(() => readTruckFields(currentTruck), [currentTruck]);
 
   const counts = useMemo(() => {
-    const summary = { detected: detectedTrucks.length, approved: 0, rejected: 0, pending: 0 };
+    const summary = { detected: detectedTrucks.length, approved: 0, rejected: 0, pending: 0, withTrailer: 0, withoutTrailer: 0 };
     for (const truck of detectedTrucks) {
       if (truck.review_status === "approved") summary.approved += 1;
       else if (truck.review_status === "rejected") summary.rejected += 1;
       else summary.pending += 1;
+      const type = (truck.truck_type || truck.type || "").toLowerCase();
+      if (type.includes("with_container") || type.includes("with container")) summary.withTrailer += 1;
+      else summary.withoutTrailer += 1;
     }
     return summary;
   }, [detectedTrucks]);
@@ -240,6 +252,41 @@ export default function App() {
       };
     });
   }, [detectedTrucks, groupByField]);
+
+  const gateRows = useMemo(() => {
+    const groups = new Map();
+    for (const truck of detectedTrucks) {
+      const fields = readTruckFields(truck);
+      const key =
+        (fields.license_plate !== "—" ? fields.license_plate : null) ||
+        (fields.container_number !== "—" ? fields.container_number : null) ||
+        (fields.truck_number !== "—" ? fields.truck_number : null) ||
+        truck.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(truck);
+    }
+    return [...groups.values()].map((trucks) => {
+      const best = trucks.reduce((a, b) =>
+        (a.confidence_avg ?? 0) >= (b.confidence_avg ?? 0) ? a : b, trucks[0]);
+      let merged = {};
+      for (const t of trucks) merged = mergeInfo(merged, t.associated_info || {});
+      // Collect camera → track_id from _fusion metadata across all trucks in group
+      const cameraMap = {};
+      for (const t of trucks) {
+        const ft = t.associated_info?._fusion?.source_track_ids;
+        if (ft && Object.keys(ft).length > 0) Object.assign(cameraMap, ft);
+      }
+      if (Object.keys(cameraMap).length === 0) {
+        cameraMap[`T#${best.track_id}`] = best.track_id;
+      }
+      return {
+        ...best,
+        associated_info: { ...merged, _fusion: { ...(merged._fusion || {}), source_track_ids: cameraMap } },
+        _sourceTracks: trucks.map((t) => `T#${t.track_id}`).join(" + "),
+        _groupCount: trucks.length,
+      };
+    });
+  }, [detectedTrucks]);
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -709,6 +756,13 @@ export default function App() {
                   </button>
                   <button
                     type="button"
+                    className={dashboardView === "gate" ? "toggle-btn active" : "toggle-btn"}
+                    onClick={() => setDashboardView("gate")}
+                  >
+                    Gate
+                  </button>
+                  <button
+                    type="button"
                     className={groupByField ? "toggle-btn active" : "toggle-btn"}
                     onClick={() => setGroupByField((v) => !v)}
                     title="Group rows that share the same license plate / container number / truck number"
@@ -718,6 +772,8 @@ export default function App() {
                 </div>
                 <div className="counts">
                   <span>Detected: {counts.detected}</span>
+                  <span className="count-trailer">With Trailer: {counts.withTrailer}</span>
+                  <span className="count-no-trailer">No Trailer: {counts.withoutTrailer}</span>
                   <span>Approved: {counts.approved}</span>
                   <span>Rejected: {counts.rejected}</span>
                 </div>
@@ -817,6 +873,97 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+            ) : dashboardView === "gate" ? (
+              <div className="gate-view">
+                {gateRows.length === 0 && <div className="empty-cell">No detected vehicles yet.</div>}
+                <div className="gate-summary-bar">
+                  <span className="gate-summary-item"><b>{gateRows.length}</b> vehicle{gateRows.length !== 1 ? "s" : ""}</span>
+                  <span className="gate-summary-sep">|</span>
+                  <span className="gate-summary-item trailer-yes"><b>{gateRows.filter(t => (t.truck_type || "").toLowerCase().includes("with_container")).length}</b> with trailer</span>
+                  <span className="gate-summary-sep">|</span>
+                  <span className="gate-summary-item trailer-no"><b>{gateRows.filter(t => !(t.truck_type || "").toLowerCase().includes("with_container")).length}</b> without trailer</span>
+                </div>
+                <div className="gate-cards">
+                  {gateRows.map((truck, idx) => {
+                    const fields = readTruckFields(truck);
+                    const status = truck.review_status || "pending";
+                    const fusion = truck.associated_info?._fusion;
+                    const cameraMap = fusion?.source_track_ids || {};
+                    const cameras = Object.keys(cameraMap);
+                    const hasTrailer = (truck.truck_type || "").toLowerCase().includes("with_container");
+                    const timeRange = `${formatTimeSec(truck.first_seen_time_sec)} – ${formatTimeSec(truck.last_seen_time_sec)}`;
+                    const duration = truck.duration_sec != null ? `${Number(truck.duration_sec).toFixed(1)}s` : "—";
+                    const matchConf = fusion?.match_confidence ?? fields.confidence;
+                    return (
+                      <article key={truck.id} className={`gate-card ${status === "rejected" ? "gate-card-rejected" : ""}`}>
+                        <div className="gate-card-header">
+                          <span className="gate-vehicle-num">Vehicle {idx + 1}</span>
+                          <span className={`gate-type-badge ${hasTrailer ? "badge-trailer" : "badge-no-trailer"}`}>
+                            {hasTrailer ? "WITH TRAILER" : "NO TRAILER"}
+                          </span>
+                          <span className="gate-time">{timeRange}</span>
+                          <span className={`status-chip status-${status}`}>{status}</span>
+                        </div>
+                        {cameras.length > 0 && (
+                          <div className="gate-cameras">
+                            <span className="gate-cameras-label">Cameras</span>
+                            {cameras.map((cam) => (
+                              <span key={cam} className="gate-cam-badge">{cam} <span className="gate-cam-track">T#{cameraMap[cam]}</span></span>
+                            ))}
+                            {truck._groupCount > 1 && cameras.length === 0 && (
+                              <span className="gate-cam-badge">{truck._sourceTracks}</span>
+                            )}
+                          </div>
+                        )}
+                        <div className="gate-fields">
+                          {fields.license_plate !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">License Plate</span>
+                              <span className="gate-field-value strong">{fields.license_plate}</span>
+                            </div>
+                          )}
+                          {fields.container_number !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Container No.</span>
+                              <span className="gate-field-value strong">{fields.container_number}</span>
+                            </div>
+                          )}
+                          {fields.container_side_no !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Side No.</span>
+                              <span className="gate-field-value">{fields.container_side_no}</span>
+                            </div>
+                          )}
+                          {fields.truck_number !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Truck No.</span>
+                              <span className="gate-field-value">{fields.truck_number}</span>
+                            </div>
+                          )}
+                          {fields.truck_company !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Company</span>
+                              <span className="gate-field-value">{fields.truck_company}</span>
+                            </div>
+                          )}
+                          <div className="gate-field">
+                            <span className="gate-field-label">Duration</span>
+                            <span className="gate-field-value">{duration}</span>
+                          </div>
+                          <div className="gate-field">
+                            <span className="gate-field-label">Confidence</span>
+                            <span className="gate-field-value">{matchConf}</span>
+                          </div>
+                        </div>
+                        <div className="row-actions">
+                          <button type="button" className="mini-approve" onClick={() => handleApprove(truck.id)} disabled={status === "rejected"}>Approve</button>
+                          <button type="button" className="mini-reject" onClick={() => handleReject(truck.id)} disabled={status === "rejected"}>Reject</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
             ) : (
               <div className="list-view">
                 {detectedTrucks.length === 0 && <div className="empty-cell">No detected trucks yet.</div>}
@@ -845,22 +992,8 @@ export default function App() {
                         <p><b>last_bbox:</b> {shortText(fields.bbox, 40)}</p>
                       </div>
                       <div className="row-actions">
-                        <button
-                          type="button"
-                          className="mini-approve"
-                          onClick={() => handleApprove(truck.id)}
-                          disabled={status === "rejected"}
-                        >
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-reject"
-                          onClick={() => handleReject(truck.id)}
-                          disabled={status === "rejected"}
-                        >
-                          Reject
-                        </button>
+                        <button type="button" className="mini-approve" onClick={() => handleApprove(truck.id)} disabled={status === "rejected"}>Approve</button>
+                        <button type="button" className="mini-reject" onClick={() => handleReject(truck.id)} disabled={status === "rejected"}>Reject</button>
                       </div>
                     </article>
                   );
