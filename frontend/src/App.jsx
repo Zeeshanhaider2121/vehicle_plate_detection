@@ -179,6 +179,7 @@ export default function App() {
   const [processStatus, setProcessStatus] = useState("idle");
   const [videoPlaying, setVideoPlaying] = useState(true);
   const [ocrLog, setOcrLog] = useState([]);
+  const [groupByField, setGroupByField] = useState(false);
   const videoRef = useRef(null);
 
   function toggleVideo() {
@@ -210,6 +211,35 @@ export default function App() {
   }, [detectedTrucks]);
 
   const pendingCount = counts.pending;
+
+  const displayRows = useMemo(() => {
+    if (!groupByField) return detectedTrucks;
+
+    const groups = new Map();
+    for (const truck of detectedTrucks) {
+      const fields = readTruckFields(truck);
+      const key =
+        (fields.license_plate !== "—" ? fields.license_plate : null) ||
+        (fields.container_number !== "—" ? fields.container_number : null) ||
+        (fields.truck_number !== "—" ? fields.truck_number : null) ||
+        truck.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(truck);
+    }
+
+    return [...groups.values()].map((trucks) => {
+      const best = trucks.reduce((a, b) =>
+        (a.confidence_avg ?? 0) >= (b.confidence_avg ?? 0) ? a : b, trucks[0]);
+      let merged = {};
+      for (const t of trucks) merged = mergeInfo(merged, t.associated_info || {});
+      return {
+        ...best,
+        associated_info: merged,
+        _sourceTracks: trucks.map((t) => `T#${t.track_id}`).join(" + "),
+        _groupCount: trucks.length,
+      };
+    });
+  }, [detectedTrucks, groupByField]);
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -677,6 +707,14 @@ export default function App() {
                   >
                     List
                   </button>
+                  <button
+                    type="button"
+                    className={groupByField ? "toggle-btn active" : "toggle-btn"}
+                    onClick={() => setGroupByField((v) => !v)}
+                    title="Group rows that share the same license plate / container number / truck number"
+                  >
+                    Group
+                  </button>
                 </div>
                 <div className="counts">
                   <span>Detected: {counts.detected}</span>
@@ -692,6 +730,7 @@ export default function App() {
                     <tr>
                       <th>Status</th>
                       <th>Truck ID</th>
+                      {groupByField && <th>Source Tracks</th>}
                       <th>truck_class</th>
                       <th>container_company_logo</th>
                       <th>container_number</th>
@@ -713,22 +752,28 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {detectedTrucks.length === 0 && (
+                    {displayRows.length === 0 && (
                       <tr>
-                          <td colSpan={20} className="empty-cell">
+                          <td colSpan={groupByField ? 21 : 20} className="empty-cell">
                             No detected trucks yet.
                         </td>
                       </tr>
                     )}
-                    {detectedTrucks.map((truck) => {
+                    {displayRows.map((truck) => {
                       const fields = readTruckFields(truck);
                       const status = truck.review_status || "pending";
+                      const sourceTracks = truck._sourceTracks || `T#${truck.track_id}`;
                       return (
                         <tr key={truck.id} className={status === "rejected" ? "row-rejected" : ""}>
                           <td>
                             <span className={`status-chip status-${status}`}>{status}</span>
                           </td>
                           <td>{fields.trackId}</td>
+                          {groupByField && (
+                            <td>
+                              <span className="source-tracks-cell" title={sourceTracks}>{sourceTracks}</span>
+                            </td>
+                          )}
                           <td><span className="cell-truncate" title={fields.truckClass}>{shortText(fields.truckClass, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.container_number}>{shortText(fields.container_number, 24)}</span></td>
