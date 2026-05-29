@@ -1,0 +1,64 @@
+{
+  "session": {
+    "video_path": "/var/folders/x7/_27z4bbj7tg3swh3x02mymc40000gn/T/plateflow_job_infqsyoj/in-lane-3-back-zoom-nvr-20260429104732-20260429114529-1999865_UnbMQ8Jc (1).mp4",
+    "total_frames": 10376,
+    "video_fps": 30.0,
+    "resolution": "1280x720",
+    "started_at": "2026-05-24T23:39:35",
+    "device": "mps",
+    "model": "/Users/man/Documents/GitHub/vehicle_plate_detection/backend/model/best.pt",
+    "lock_after_n_frames": 5
+  },
+  "summary": {
+    "total_trucks_tracked": 2,
+    "trucks_with_container": 1,
+    "trucks_without_container": 1
+  },
+  "trucks": {
+    "2": {
+      "track_id": 2,
+      "type": "truck_without_container",
+      "first_seen_frame": 220,
+      "last_seen_frame": 239,
+      "first_seen_time_sec": 7.333,
+      "last_seen_time_sec": 7.967,
+      "duration_frames": 20,
+      "duration_sec": 0.667,
+      "confidence_avg": 0.9547,
+      "last_bbox": [
+        358,
+        108,
+        1098,
+        720
+      ],
+      "associated_info": {
+        "license_plate": null,
+        "truck_company": null,
+        "truck_number": null
+      }
+    },
+    "1": {
+      "track_id": 1,
+      "type": "truck_with_container",
+      "first_seen_frame": 232,
+      "last_seen_frame": 239,
+      "first_seen_time_sec": 7.733,
+      "last_seen_time_sec": 7.967,
+      "duration_frames": 8,
+      "duration_sec": 0.267,
+      "confidence_avg": 0.9464,
+      "last_bbox": [
+        20,
+        93,
+        644,
+        594
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": null,
+        "container_company_logo": null,
+        "other_container_info": null
+      }
+    }
+  }
+}

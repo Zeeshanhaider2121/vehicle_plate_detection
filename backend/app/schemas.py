@@ -170,39 +170,3 @@ class VideoAnalyzeFinalizeResponse(BaseModel):
     state: str
     run_id: str
     stored_trucks: int
-
-
-class MultiCameraChildStatus(BaseModel):
-    camera: str
-    job_id: str | None = None
-    state: str = "unknown"
-    progress: float | None = None
-    frame_id: int | None = None
-    total_frames: int | None = None
-    fps: float | None = None
-    message: str | None = None
-
-
-class MultiCameraAnalyzeStartResponse(BaseModel):
-    mode: str
-    job_id: str
-    state: str
-    message: str
-    cameras: list[MultiCameraChildStatus]
-
-
-class MultiCameraAnalyzeStatusResponse(BaseModel):
-    job_id: str
-    state: str
-    progress: float | None = None
-    message: str | None = None
-    cameras: list[MultiCameraChildStatus]
-    json_snapshot: str | None = None
-    ocr_log: list[str] = Field(default_factory=list)
-
-
-class MultiCameraAnalyzeFinalizeResponse(BaseModel):
-    job_id: str
-    state: str
-    run_id: str
-    stored_trucks: int
