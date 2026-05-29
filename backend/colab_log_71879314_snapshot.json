@@ -1,0 +1,147 @@
+{
+  "session": {
+    "video_path": "/var/folders/x7/_27z4bbj7tg3swh3x02mymc40000gn/T/plateflow_job_lkc5eqao/ff2_IN_LANE_2_PTZ(2)_NVR_20260525131101_20260525132001_828361-26_05_2026, 16_35.mp4",
+    "total_frames": 9615,
+    "video_fps": 30.0,
+    "resolution": "1920x1080",
+    "started_at": "2026-05-29T00:48:20",
+    "device": "mps",
+    "model": "/Users/man/Documents/GitHub/vehicle_plate_detection/backend/model/best.pt",
+    "confidence": 0.45,
+    "truck_confidence": 0.7,
+    "infer_width": 1280,
+    "tracker": "/Users/man/Documents/GitHub/vehicle_plate_detection/backend/plateflow_outputs/custom_bytetrack.yaml",
+    "save_detection_crops": true,
+    "lock_after_n_frames": 5,
+    "enable_frame_skip": false,
+    "process_every_n_frames": 1,
+    "ocr_every_n_frames": 1
+  },
+  "summary": {
+    "total_trucks_tracked": 3,
+    "trucks_with_container": 3,
+    "trucks_without_container": 0
+  },
+  "trucks": {
+    "1": {
+      "track_id": 1,
+      "type": "truck_with_container",
+      "first_seen_frame": 37,
+      "last_seen_frame": 56,
+      "first_seen_time_sec": 1.233,
+      "last_seen_time_sec": 1.867,
+      "duration_frames": 20,
+      "duration_sec": 0.667,
+      "confidence_avg": 0.7493,
+      "last_bbox": [
+        1617,
+        120,
+        1848,
+        340
+      ],
+      "union_bbox": [
+        1617,
+        120,
+        1899,
+        355
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": null,
+        "container_company_logo": {
+          "text": "Close-up of a metallic cylindrical object with no visible text or symbols",
+          "confidence": 0.462
+        },
+        "other_container_info": null,
+        "license_plate": {
+          "text": "Close-up of a metallic mechanical component with two circular features (no visible text or symbols)",
+          "confidence": 0.6448
+        },
+        "truck_company": null,
+        "truck_number": null
+      }
+    },
+    "9": {
+      "track_id": 9,
+      "type": "truck_with_container",
+      "first_seen_frame": 137,
+      "last_seen_frame": 260,
+      "first_seen_time_sec": 4.567,
+      "last_seen_time_sec": 8.667,
+      "duration_frames": 124,
+      "duration_sec": 4.133,
+      "confidence_avg": 0.8409,
+      "last_bbox": [
+        0,
+        19,
+        675,
+        1074
+      ],
+      "union_bbox": [
+        0,
+        0,
+        1920,
+        1080
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": {
+          "text": "ATSU 310638",
+          "confidence": 0.9155
+        },
+        "container_company_logo": {
+          "text": "EAR",
+          "confidence": 0.9273
+        },
+        "other_container_info": null,
+        "license_plate": {
+          "text": "Close-up of a metallic ring or button with two small square cutouts, set against a blue background (no visible text or symbols)",
+          "confidence": 0.8001
+        },
+        "truck_company": null,
+        "truck_number": null
+      }
+    },
+    "25": {
+      "track_id": 25,
+      "type": "truck_with_container",
+      "first_seen_frame": 285,
+      "last_seen_frame": 2369,
+      "first_seen_time_sec": 9.5,
+      "last_seen_time_sec": 78.967,
+      "duration_frames": 2085,
+      "duration_sec": 69.5,
+      "confidence_avg": 0.8146,
+      "last_bbox": [
+        282,
+        27,
+        1623,
+        1074
+      ],
+      "union_bbox": [
+        91,
+        25,
+        1812,
+        1077
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": {
+          "text": "AR PEN",
+          "confidence": 0.7466
+        },
+        "container_company_logo": {
+          "text": "EAR",
+          "confidence": 0.8784
+        },
+        "other_container_info": null,
+        "license_plate": {
+          "text": "CA 2076",
+          "confidence": 0.8887
+        },
+        "truck_company": null,
+        "truck_number": null
+      }
+    }
+  }
+}
