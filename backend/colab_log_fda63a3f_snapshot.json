@@ -1,0 +1,26 @@
+{
+  "session": {
+    "video_path": "/tmp/plateflow_job_3y4b30rs/ff2_IN_LANE_2_PTZ(2)_NVR_20260525131101_20260525132001_828361-26_05_2026, 16_35.mp4",
+    "total_frames": 9615,
+    "video_fps": 30.0,
+    "resolution": "1920x1080",
+    "started_at": "2026-05-29T11:49:24",
+    "device": "cuda",
+    "model": "/content/drive/MyDrive/vehicle_plate/output/runs/yolo26x_seg_phase2/weights/best.pt",
+    "confidence": 0.45,
+    "truck_confidence": 0.7,
+    "infer_width": 1280,
+    "tracker": "/content/drive/MyDrive/plateflow_outputs/custom_bytetrack.yaml",
+    "save_detection_crops": true,
+    "lock_after_n_frames": 5,
+    "enable_frame_skip": false,
+    "process_every_n_frames": 1,
+    "ocr_every_n_frames": 1
+  },
+  "summary": {
+    "total_trucks_tracked": 0,
+    "trucks_with_container": 0,
+    "trucks_without_container": 0
+  },
+  "trucks": {}
+}

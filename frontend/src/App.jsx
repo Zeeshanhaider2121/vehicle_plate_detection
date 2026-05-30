@@ -1,9 +1,12 @@
 import { useMemo, useRef, useState } from "react";
 import {
   fetchTruckRecords,
+  finalizeMultiCamera,
   finalizeVideoTruckRun,
+  getMultiCameraStatus,
   getVideoTruckRunFrameUrl,
   getVideoTruckRunStatus,
+  startMultiCameraTruckRun,
   startVideoTruckRun
 } from "./api";
 
@@ -189,6 +192,9 @@ export default function App() {
   const [videoPlaying, setVideoPlaying] = useState(true);
   const [ocrLog, setOcrLog] = useState([]);
   const [groupByField, setGroupByField] = useState(false);
+  const [multiCamMode, setMultiCamMode] = useState(false);
+  const [camFiles, setCamFiles] = useState({ front: null, right: null, back: null, left: null });
+  const [videoZoom, setVideoZoom] = useState(1);
   const videoRef = useRef(null);
 
   function toggleVideo() {
@@ -381,12 +387,42 @@ export default function App() {
     throw new Error("Video processing timed out while waiting for completion.");
   }
 
-  async function handleVideoUpload() {
-    if (!videoFile) {
-      setMessage("Please select a video file.");
-      return;
+  async function pollMultiCameraUntilComplete(jobId) {
+    const maxPolls = 900;
+    const maxRetries = 5;
+    let retries = 0;
+    for (let i = 0; i < maxPolls; i += 1) {
+      let status;
+      try {
+        status = await getMultiCameraStatus(jobId);
+      } catch {
+        retries += 1;
+        if (retries <= maxRetries) { await sleep(2000); continue; }
+        throw new Error("Multi-camera backend unreachable after retries.");
+      }
+      retries = 0;
+      const progress = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
+      setMessage(`Multi-camera ${jobId.slice(0, 8)} | ${status.state} | ${progress}`);
+      if (status.ocr_log && status.ocr_log.length > 0) {
+        setOcrLog((prev) => {
+          const combined = [...prev, ...status.ocr_log];
+          return combined.slice(-50);
+        });
+      }
+      if (status.json_snapshot) {
+        try {
+          const snap = JSON.parse(status.json_snapshot);
+          mergeSnapshotRows(snap?.trucks || {});
+        } catch { /* ignore */ }
+      }
+      if (status.state === "completed") return;
+      if (status.state === "failed") throw new Error(status.message || "Multi-camera processing failed.");
+      await sleep(2000);
     }
+    throw new Error("Multi-camera processing timed out.");
+  }
 
+  async function handleVideoUpload() {
     setLoading(true);
     setMessage("");
     setProcessStatus("uploading");
@@ -396,35 +432,57 @@ export default function App() {
       setReviewIndex(0);
       setActiveJobId("");
       setStreamFrameUrl("");
-      setMessage(`File uploaded: ${videoFile.name}. Starting GPU processing...`);
       setStreamWarning("");
       setStreamErrorCount(0);
 
-      const start = await startVideoTruckRun(videoFile, analysisJsonFile);
-      let currentRunId = start.run_id;
-      let storedTrucks = start.stored_trucks ?? 0;
+      let currentRunId;
+      let storedTrucks = 0;
 
-      if (start.mode !== "direct_json") {
-        const jobId = start.job_id;
-        if (!jobId) {
-          throw new Error("Missing job_id from backend start endpoint.");
+      if (multiCamMode) {
+        const selected = Object.fromEntries(
+          Object.entries(camFiles).filter(([, f]) => f != null)
+        );
+        if (Object.keys(selected).length < 2) {
+          throw new Error("Select at least 2 camera angles.");
         }
-        setActiveJobId(jobId);
-        setMessage(`Video job started (${jobId.slice(0, 8)}). Processing on Colab GPU...`);
+        setMessage("Starting multi-camera jobs...");
+        const start = await startMultiCameraTruckRun(selected);
+        const aggregateJobId = start.job_id;
+        if (!aggregateJobId) throw new Error("Missing multi-camera job_id.");
+        setActiveJobId(aggregateJobId);
         setProcessStatus("processing");
-        await pollJobUntilComplete(jobId);
-        const finalized = await finalizeVideoTruckRun(jobId);
+        await pollMultiCameraUntilComplete(aggregateJobId);
+        const finalized = await finalizeMultiCamera(aggregateJobId);
         currentRunId = finalized.run_id;
         storedTrucks = finalized.stored_trucks;
         setActiveJobId("");
+      } else {
+        if (!videoFile) {
+          setMessage("Please select a video file.");
+          setLoading(false);
+          return;
+        }
+        setMessage(`File uploaded: ${videoFile.name}. Starting GPU processing...`);
+        const start = await startVideoTruckRun(videoFile, analysisJsonFile);
+        currentRunId = start.run_id;
+        storedTrucks = start.stored_trucks ?? 0;
+        if (start.mode !== "direct_json") {
+          const jobId = start.job_id;
+          if (!jobId) throw new Error("Missing job_id from backend.");
+          setActiveJobId(jobId);
+          setMessage(`Video job started (${jobId.slice(0, 8)}). Processing on Colab GPU...`);
+          setProcessStatus("processing");
+          await pollJobUntilComplete(jobId);
+          const finalized = await finalizeVideoTruckRun(jobId);
+          currentRunId = finalized.run_id;
+          storedTrucks = finalized.stored_trucks;
+          setActiveJobId("");
+        }
       }
 
-      if (!currentRunId) {
-        throw new Error("No run_id returned after processing.");
-      }
+      if (!currentRunId) throw new Error("No run_id returned.");
 
       setRunId(currentRunId);
-
       const trucksResult = await fetchTruckRecords(currentRunId, "");
       const dbTrucks = (trucksResult.items || []).map((truck) => normalizeTruckFromDb(truck));
       if (dbTrucks.length > 0) {
@@ -444,15 +502,11 @@ export default function App() {
       }
 
       setProcessStatus("complete");
-      setMessage(
-        `Detection loaded from model output. Run ID: ${currentRunId}. Trucks detected: ${
-          storedTrucks
-        }.`
-      );
+      setMessage(`Detection loaded. Run ID: ${currentRunId}. Trucks detected: ${storedTrucks}.`);
       setStreamWarning("");
     } catch (error) {
       setProcessStatus("error");
-      setMessage(error?.response?.data?.detail || "Video upload or detection import failed.");
+      setMessage(error?.response?.data?.detail || error.message || "Video upload or detection import failed.");
     } finally {
       setLoading(false);
     }
@@ -666,6 +720,7 @@ export default function App() {
                     src={streamFrameUrl}
                     alt="Live detection stream"
                     className="stream-image"
+                    style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
                     onError={() => {
                       const next = streamErrorCount + 1;
                       setStreamErrorCount(next);
@@ -684,6 +739,7 @@ export default function App() {
                   <video
                     ref={videoRef}
                     className="stream-video"
+                    style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
                     autoPlay
                     muted
                     loop
@@ -696,6 +752,10 @@ export default function App() {
                 <button type="button" className="play-pause-btn" onClick={toggleVideo}>
                   {videoPlaying ? "⏸ Pause" : "▶ Play"}
                 </button>
+                <button type="button" className="zoom-btn" onClick={() => setVideoZoom((z) => Math.min(z + 0.25, 3))} title="Zoom in">🔍+</button>
+                <button type="button" className="zoom-btn" onClick={() => setVideoZoom((z) => Math.max(z - 0.25, 0.5))} title="Zoom out">🔍-</button>
+                <button type="button" className="zoom-btn" onClick={() => setVideoZoom(1)} title="Reset zoom">⟲</button>
+                <span className="zoom-label">{Math.round(videoZoom * 100)}%</span>
               </div>
               <div className={`process-status status-${processStatus}`}>
                 <span className="status-dot" />
@@ -709,13 +769,30 @@ export default function App() {
               </div>
               <div className="stream-upload-row">
                 <label className="upload-label">
-                  Upload Video
+                  {multiCamMode ? "Multi-Camera" : "Upload Video"}
                   <input
                     type="file"
-                    accept="video/*"
+                    accept={multiCamMode ? undefined : "video/*"}
                     onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
+                    style={multiCamMode ? { display: "none" } : {}}
                   />
                 </label>
+                <label className="cam-toggle-label">
+                  <input type="checkbox" checked={multiCamMode} onChange={() => setMultiCamMode((v) => !v)} />
+                  {" "}Multi-Cam
+                </label>
+                {multiCamMode && (
+                  <div className="cam-uploads">
+                    {["front", "right", "back", "left"].map((cam) => (
+                      <label key={cam} className="cam-upload-label">
+                        {cam}
+                        <input type="file" accept="video/*"
+                          onChange={(e) => setCamFiles((prev) => ({ ...prev, [cam]: e.target.files?.[0] || null }))}
+                        />
+                      </label>
+                    ))}
+                  </div>
+                )}
                 <button type="button" className="detect-btn" onClick={handleVideoUpload} disabled={loading}>
                   {loading ? "Detecting..." : "Detect"}
                 </button>
@@ -787,23 +864,23 @@ export default function App() {
                       <th>Status</th>
                       <th>Truck ID</th>
                       {groupByField && <th>Source Tracks</th>}
-                      <th>truck_class</th>
-                      <th>container_company_logo</th>
-                      <th>container_number</th>
-                      <th>container_side_no</th>
-                      <th>driver</th>
-                      <th>license_plate</th>
-                      <th>other_container_info</th>
-                      <th>truck_company</th>
-                      <th>truck_number</th>
-                      <th>ocr_conf</th>
-                      <th>confidence_avg</th>
-                      <th>duration_sec</th>
-                      <th>first_seen_time_sec</th>
-                      <th>last_seen_time_sec</th>
-                      <th>first_seen_frame</th>
-                      <th>last_seen_frame</th>
-                      <th>last_bbox</th>
+                      <th>Truck Class</th>
+                      <th>Company Logo</th>
+                      <th>Container No.</th>
+                      <th>Side No.</th>
+                      <th>Driver</th>
+                      <th>License Plate</th>
+                      <th>Other Info</th>
+                      <th>Truck Company</th>
+                      <th>Truck No.</th>
+                      <th>OCR Conf</th>
+                      <th>Conf Avg</th>
+                      <th>Duration</th>
+                      <th>First Seen</th>
+                      <th>Last Seen</th>
+                      <th>First Frame</th>
+                      <th>Last Frame</th>
+                      <th>BBox</th>
                       <th>Action</th>
                     </tr>
                   </thead>

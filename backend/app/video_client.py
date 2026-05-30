@@ -30,7 +30,7 @@ class ColabVideoClient:
         response = requests.post(
             self._url(settings.colab_start_video_job_path),
             files={"file": (filename, video_bytes, "video/mp4")},
-            timeout=max(settings.inference_timeout_seconds, 120),
+            timeout=max(settings.inference_timeout_seconds, 300),
         )
         response.raise_for_status()
         return response.json()

@@ -876,3 +876,75 @@ th {
   color: var(--text2);
   max-width: 180px;
 }
+
+.cam-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: var(--text2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.cam-uploads {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.cam-upload-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text2);
+  cursor: pointer;
+  background: var(--surface2);
+  transition: border-color 0.2s;
+  min-width: 100px;
+}
+
+.cam-upload-label:hover {
+  border-color: var(--blue);
+}
+
+.cam-upload-label input {
+  font-size: 0.7rem;
+  max-width: 90px;
+}
+
+.stream-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 0;
+}
+
+.zoom-btn {
+  background: var(--surface2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.zoom-btn:hover {
+  background: var(--blue-soft);
+  border-color: var(--blue);
+}
+
+.zoom-label {
+  font-size: 0.75rem;
+  color: var(--text2);
+  min-width: 36px;
+  text-align: center;
+}

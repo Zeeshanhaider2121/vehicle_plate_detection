@@ -4,7 +4,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 60000
+  timeout: 300000
 });
 
 export async function detectFile(file, sourceName) {
@@ -98,6 +98,25 @@ export async function getVideoTruckRunStatus(jobId) {
 
 export async function finalizeVideoTruckRun(jobId) {
   const { data } = await api.post(`/api/truck-runs/video/${jobId}/finalize`);
+  return data;
+}
+
+export async function startMultiCameraTruckRun(files) {
+  const formData = new FormData();
+  for (const [camera, file] of Object.entries(files)) {
+    if (file) formData.append(camera, file);
+  }
+  const { data } = await api.post("/api/truck-runs/multi-camera/start", formData);
+  return data;
+}
+
+export async function getMultiCameraStatus(jobId) {
+  const { data } = await api.get(`/api/truck-runs/multi-camera/${jobId}/status`);
+  return data;
+}
+
+export async function finalizeMultiCamera(jobId) {
+  const { data } = await api.post(`/api/truck-runs/multi-camera/${jobId}/finalize`);
   return data;
 }
 
