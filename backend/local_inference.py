@@ -19,8 +19,11 @@ import cv2
 import numpy as np
 import requests
 import torch
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from ultralytics import YOLO
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ========================= CONFIGURATION =====================================
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -54,7 +57,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 MODEL_PATH = os.getenv(
     "MODEL_PATH",
-    "/content/drive/MyDrive/vehicle_plate/output/runs/yolo26x_seg_phase2/weights/best.pt",
+    str(Path(__file__).resolve().parent / "model" / "best.pt"),
 )
 OUTPUT_DIR        = os.getenv(
     "OUTPUT_DIR",
@@ -74,6 +77,12 @@ USE_HALF          = True
 OCR_WORKERS       = 3
 SAVE_CROPS        = False
 SAVE_DETECTION_CROPS = _env_bool("SAVE_DETECTION_CROPS", True)
+SAVE_PROCESSED_FRAMES = _env_bool("SAVE_PROCESSED_FRAMES", True)
+OCR_BEST_MIN_IMPROVEMENT = _env_float("OCR_BEST_MIN_IMPROVEMENT", 0.08)
+OCR_MAX_SUBMISSIONS_PER_FIELD = _env_int("OCR_MAX_SUBMISSIONS_PER_FIELD", 3)
+DUPLICATE_FRAME_SKIP = _env_bool("DUPLICATE_FRAME_SKIP", True)
+DUPLICATE_FRAME_STABLE_COUNT = _env_int("DUPLICATE_FRAME_STABLE_COUNT", 3)
+DUPLICATE_FRAME_DIFF_THRESH = _env_float("DUPLICATE_FRAME_DIFF_THRESH", 1.5)
 MIN_ASSOC_SCORE   = 0.10
 MIN_TRUCK_AREA    = 40_000
 MIN_TRUCK_TRACK_FRAMES = _env_int("MIN_TRUCK_TRACK_FRAMES", 3)
@@ -82,7 +91,7 @@ JSON_SNAP_EVERY   = 30
 OCR_RETRY_EVERY   = 45
 
 # ── Association locking from snippet 1 ───────────────────────────────────────
-LOCK_AFTER_N_FRAMES = 5  # Lock after N consecutive frames with same truck
+LOCK_AFTER_N_FRAMES = 5  # Lock after majority votes for the same truck/field candidate
 ACTIVE_WINDOW_FRAMES = _env_int("ACTIVE_WINDOW_FRAMES", 90)
 
 MINERU_TOKEN = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI3NzgwMDYzMyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3OTExMzIyNiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiNWIxM2U3YjctN2FmNi00MzdjLThhZmEtMTIxNTRiMzQyOGQxIiwiZW1haWwiOiIiLCJleHAiOjE3ODY4ODkyMjZ9.gw3idlGC_R1ulaBBXCR_FtVszMw3y7jIbFBwQcjhgCbqVNJaoXTvtUp7GdvpMF117PPbzn1xrqm8YIybpxMN_Q"
@@ -108,6 +117,8 @@ OCR_CLASSES = {
     "truck_number",
     "container_company_logo",
     "truck_company",
+    "driver",
+    "other_container_info",
 }
 TRUCK_WITH_CONTAINER_FIELDS = {
     "container_number",
@@ -117,6 +128,7 @@ TRUCK_WITH_CONTAINER_FIELDS = {
 }
 TRUCK_WITHOUT_CONTAINER_FIELDS = {
     "license_plate",
+    "driver",
     "truck_company",
     "truck_number",
 }
@@ -133,6 +145,8 @@ if SAVE_CROPS:
     os.makedirs(os.path.join(OUTPUT_DIR, "ocr_crops"), exist_ok=True)
 if SAVE_DETECTION_CROPS:
     os.makedirs(os.path.join(OUTPUT_DIR, "detections"), exist_ok=True)
+if SAVE_PROCESSED_FRAMES:
+    os.makedirs(os.path.join(OUTPUT_DIR, "processed_frames"), exist_ok=True)
 
 # Write custom ByteTrack config for better tracking continuity
 _TRACKER_CFG_PATH = os.path.join(OUTPUT_DIR, "custom_bytetrack.yaml")
@@ -149,7 +163,7 @@ with open(_TRACKER_CFG_PATH, "w") as _f:
 YOLO_TRACKER = _TRACKER_CFG_PATH
 
 # ========================= APP + MODEL =======================================
-app = FastAPI(title="PlateFlow Colab GPU API", version="3.5.0")
+app = FastAPI(title="PlateFlow Local Inference API", version="3.5.0")
 
 def _select_device() -> str:
     if torch.cuda.is_available():
@@ -184,7 +198,18 @@ if ENABLE_FRAME_SKIP:
 else:
     print("[PlateFlow] Frame skip disabled: processing every frame", flush=True)
 print(f"[PlateFlow] OCR throttle: reading text every {OCR_EVERY_N_FRAMES} frame(s)", flush=True)
+print(
+    f"[PlateFlow] OCR best-crop limit: min_improvement={OCR_BEST_MIN_IMPROVEMENT} "
+    f"max_submissions_per_field={OCR_MAX_SUBMISSIONS_PER_FIELD}",
+    flush=True,
+)
 print(f"[PlateFlow] Save detection crops: {SAVE_DETECTION_CROPS} → {OUTPUT_DIR}/detections", flush=True)
+print(f"[PlateFlow] Save processed frames: {SAVE_PROCESSED_FRAMES} → {OUTPUT_DIR}/processed_frames", flush=True)
+print(
+    f"[PlateFlow] Duplicate-frame skip: {DUPLICATE_FRAME_SKIP} "
+    f"stable_count={DUPLICATE_FRAME_STABLE_COUNT} diff_thresh={DUPLICATE_FRAME_DIFF_THRESH}",
+    flush=True,
+)
 print(f"[PlateFlow] Ghost-track filter: min {MIN_TRUCK_TRACK_FRAMES} frames before truck appears in output", flush=True)
 model    = YOLO(MODEL_PATH)
 model.to(DEVICE)
@@ -215,6 +240,7 @@ class VideoJob:
     progress: float = 0.0
     frame_id: int = 0
     total_frames: int = 0
+    latest_frame_id: int = 0
     fps: float = 0.0
     result: dict[str, Any] | None = None
     error: str | None = None
@@ -243,6 +269,7 @@ class VideoJob:
     
     # Best confidence tracker per (cls_name, track_id)
     ocr_best_conf: dict[tuple[str, int], float] = field(default_factory=dict)
+    ocr_submit_counts: dict[tuple[str, int], int] = field(default_factory=dict)
 
     # Buffered OCR results that had no compatible truck at completion time.
     # Flushed to the registry every few frames once a truck appears.
@@ -334,7 +361,7 @@ def _update_association_votes(
     truck_type: str,
 ) -> None:
     """
-    Majority-vote locking: accumulate votes per (truck_tid, truck_type) candidate.
+    Majority-vote locking: accumulate votes per (truck_tid, truck_type, field) candidate.
     Locks permanently when any candidate reaches LOCK_AFTER_N_FRAMES total votes.
     A single different frame no longer resets the counter.
     """
@@ -342,7 +369,7 @@ def _update_association_votes(
         return
 
     votes = job.child_assoc_votes.setdefault(track_id, {})
-    key = (truck_tid, truck_type)
+    key = (truck_tid, truck_type, cls_name)
     votes[key] = votes.get(key, 0) + 1
     best_key = max(votes, key=lambda k: votes[k])
     best_count = votes[best_key]
@@ -354,7 +381,7 @@ def _update_association_votes(
         job.child_to_truck[track_id] = {
             "truck_tid": best_key[0],
             "truck_type": best_key[1],
-            "field": cls_name,
+            "field": best_key[2],
         }
         del job.child_assoc_votes[track_id]
         print(f"  [LOCKED] ✅ child T#{track_id} ({cls_name}) "
@@ -497,6 +524,7 @@ class TruckRegistry:
         "container_side_no": None,
         "container_company_logo": None,
         "other_container_info": None,
+        "driver": None,
         "license_plate": None,
         "truck_company": None,
         "truck_number": None,
@@ -560,6 +588,22 @@ class TruckRegistry:
             n = rec["_conf_n"]
             rec["confidence_avg"] = round((rec["confidence_avg"] * n + conf) / (n + 1), 4)
             rec["_conf_n"] = n + 1
+
+    def extend_active_tracks(self, frame_id: int, track_ids: set[int]) -> None:
+        """Advance timing for already-visible tracks when a duplicate frame is skipped."""
+        if not track_ids:
+            return
+        with self._lock:
+            for track_id in track_ids:
+                rec = self.trucks.get(track_id)
+                if rec is None:
+                    continue
+                if frame_id <= rec.get("last_seen_frame", -1):
+                    continue
+                rec["last_seen_frame"] = frame_id
+                rec["last_seen_time_sec"] = round(frame_id / self.fps, 3)
+                rec["duration_frames"] = frame_id - rec["first_seen_frame"] + 1
+                rec["duration_sec"] = round(rec["duration_frames"] / self.fps, 3)
 
     def attach_ocr(
         self,
@@ -786,6 +830,17 @@ def _resize_for_inference(frame: np.ndarray) -> tuple[np.ndarray, float]:
     return cv2.resize(frame, (INFER_WIDTH, int(h * scale)), interpolation=cv2.INTER_LINEAR), scale
 
 
+def _frame_signature(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (64, 36), interpolation=cv2.INTER_AREA)
+
+
+def _frame_diff_score(previous: np.ndarray | None, current: np.ndarray) -> float:
+    if previous is None:
+        return float("inf")
+    return float(np.mean(cv2.absdiff(previous, current)))
+
+
 def _save_detection_crop(
     frame: np.ndarray,
     cls_name: str,
@@ -823,6 +878,17 @@ def _save_detection_crop(
             f,
             indent=2,
         )
+
+
+def _save_processed_frame(job_id: str | None, frame_id: int, frame: np.ndarray) -> str | None:
+    if not SAVE_PROCESSED_FRAMES:
+        return None
+    safe_job = re.sub(r"[^A-Za-z0-9_.-]", "_", job_id or "sync")
+    frame_dir = os.path.join(OUTPUT_DIR, "processed_frames", safe_job)
+    os.makedirs(frame_dir, exist_ok=True)
+    path = os.path.join(frame_dir, f"f{frame_id:06d}.jpg")
+    cv2.imwrite(path, frame)
+    return path
 
 
 def _preprocess_crop(crop_bgr: np.ndarray) -> np.ndarray:
@@ -942,14 +1008,30 @@ def _enqueue_ocr(
     truck_type: str | None,
     child_track_id: int | None = None,
     conf: float = 0.0,
+    assoc_snapshot: dict[str, Any] | None = None,
 ) -> None:
     with _jobs_lock:
         job = JOBS.get(job_id)
         if job is None:
             return
+        if assoc_snapshot is None and child_track_id is not None:
+            locked = job.child_to_truck.get(child_track_id)
+            if locked:
+                assoc_snapshot = dict(locked)
         job.submitted_keys.add(key)
         job.pending_keys.add(key)
-    _ocr_queue.put((job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id, conf))
+    _ocr_queue.put((
+        job_id,
+        key,
+        crop_rgb,
+        field,
+        frame_id,
+        truck_tid,
+        truck_type,
+        child_track_id,
+        conf,
+        assoc_snapshot,
+    ))
 
 
 def _ocr_worker() -> None:
@@ -957,7 +1039,18 @@ def _ocr_worker() -> None:
         item = _ocr_queue.get()
         if item is None:
             break
-        job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id, conf = item
+        (
+            job_id,
+            key,
+            crop_rgb,
+            field,
+            frame_id,
+            truck_tid,
+            truck_type,
+            child_track_id,
+            conf,
+            assoc_snapshot,
+        ) = item
         
         with _jobs_lock:
             job = JOBS.get(job_id)
@@ -965,8 +1058,14 @@ def _ocr_worker() -> None:
                 _ocr_queue.task_done()
                 continue
             
-            # ── Look up permanent locked association if available ──────────────────
-            if child_track_id is not None and child_track_id in job.child_to_truck:
+            # Prefer the enqueue-time association snapshot. OCR can finish long
+            # after the object leaves the active registry window.
+            if assoc_snapshot:
+                truck_tid = assoc_snapshot["truck_tid"]
+                truck_type = assoc_snapshot["truck_type"]
+                field = assoc_snapshot["field"]
+                print(f"  [OCR] using SNAPSHOT association: child T#{child_track_id} → T#{truck_tid}")
+            elif child_track_id is not None and child_track_id in job.child_to_truck:
                 lock = job.child_to_truck[child_track_id]
                 truck_tid = lock["truck_tid"]
                 truck_type = lock["truck_type"]
@@ -1025,6 +1124,8 @@ def _ocr_worker() -> None:
                 
                 job.ocr_log.append(log)
                 job.ocr_log = job.ocr_log[-60:]
+                if job.registry is not None:
+                    job.json_snapshot = json.dumps(job.registry.to_dict(job.session_info), indent=2)
                 print(f"  [OCR] ✓ {key} → '{plain_text}'")
             else:
                 # Empty result — remove from submitted so retry is possible
@@ -1067,10 +1168,14 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         "infer_width": INFER_WIDTH,
         "tracker": YOLO_TRACKER,
         "save_detection_crops": SAVE_DETECTION_CROPS,
+        "save_processed_frames": SAVE_PROCESSED_FRAMES,
         "lock_after_n_frames": LOCK_AFTER_N_FRAMES,  # Record locking config
         "enable_frame_skip": ENABLE_FRAME_SKIP,
         "process_every_n_frames": PROCESS_EVERY_N_FRAMES if ENABLE_FRAME_SKIP else 1,
         "ocr_every_n_frames": OCR_EVERY_N_FRAMES,
+        "duplicate_frame_skip": DUPLICATE_FRAME_SKIP,
+        "duplicate_frame_stable_count": DUPLICATE_FRAME_STABLE_COUNT,
+        "duplicate_frame_diff_thresh": DUPLICATE_FRAME_DIFF_THRESH,
     }
 
     registry = TruckRegistry(fps=fps)
@@ -1084,11 +1189,43 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
     frame_id   = 0
     t_prev     = time.time()
     fps_smooth = 0.0
+    previous_frame_signature: np.ndarray | None = None
+    same_frame_count = 0
+    last_processed_truck_ids: set[int] = set()
+    processed_frame_count = 0
+    processed_frame_ids: list[int] = []
+    processed_frame_paths: list[str] = []
 
     while True:
         ret, frame_orig = cap.read()
         if not ret:
             break
+
+        frame_signature = _frame_signature(frame_orig)
+        frame_diff = _frame_diff_score(previous_frame_signature, frame_signature)
+        if frame_diff <= DUPLICATE_FRAME_DIFF_THRESH:
+            same_frame_count += 1
+        else:
+            same_frame_count = 1
+        previous_frame_signature = frame_signature
+
+        if DUPLICATE_FRAME_SKIP and same_frame_count > DUPLICATE_FRAME_STABLE_COUNT:
+            registry.extend_active_tracks(frame_id, last_processed_truck_ids)
+            frame_id += 1
+            if job is not None:
+                progress = (frame_id / total_frames) if total_frames > 0 else 0.0
+                _set_job(
+                    job.job_id,
+                    progress=progress,
+                    frame_id=frame_id,
+                    message=(
+                        f"Duplicate frame skipped after {DUPLICATE_FRAME_STABLE_COUNT} stable frames; "
+                        f"advanced timing to frame {frame_id}/{total_frames}."
+                    ),
+                )
+                if frame_id % JSON_SNAP_EVERY == 0:
+                    _set_job(job.job_id, json_snapshot=json.dumps(registry.to_dict(session_info), indent=2))
+            continue
 
         # ── Frame-skip ────────────────────────────────────────────────────────
         if FRAME_SKIP > 0 and frame_id % (FRAME_SKIP + 1) != 0:
@@ -1192,10 +1329,13 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     remapped.append((x1, y1, x2, y2, cls_id, conf_val, track_id, mask))
             boxes_data = remapped
 
+        current_truck_ids: set[int] = set()
         for x1, y1, x2, y2, cls_id, conf_val, track_id, _mask in boxes_data:
             cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
             if cls_name in TRUCK_CLASSES and track_id is not None:
                 registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val)
+                current_truck_ids.add(track_id)
+        last_processed_truck_ids = current_truck_ids
 
         # ── Flush buffered orphan OCR results every 5 frames ────────────────────
         if job is not None and frame_id % 5 == 0 and job.orphan_buffer:
@@ -1249,8 +1389,6 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             cls_name = CLASS_NAMES[cls_id] if cls_id < len(CLASS_NAMES) else str(cls_id)
             if cls_name not in OCR_CLASSES:
                 continue
-            if frame_id % OCR_EVERY_N_FRAMES != 0:
-                continue
 
             crop_bgr = frame_orig[y1:y2, x1:x2].copy()
             if crop_bgr.size == 0:
@@ -1266,6 +1404,12 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             truck_tid, truck_type, field = None, None, cls_name
             if i in assoc_map:
                 truck_tid, truck_type, field = assoc_map[i]
+            elif job is not None:
+                fallback_tid = registry.find_truck_for_field(field, current_frame=frame_id)
+                if fallback_tid is not None:
+                    rec = registry.trucks.get(fallback_tid)
+                    truck_tid = fallback_tid
+                    truck_type = rec["type"] if rec else None
 
             # Use truck-field-scoped key when we have a truck association
             key = _det_key(track_id, frame_id, i, truck_tid, field)
@@ -1282,28 +1426,44 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                 if best_key:
                     with _jobs_lock:
                         prev_best = job.ocr_best_conf.get(best_key, 0.0)
-                        if conf_val > prev_best:
+                        submit_count = job.ocr_submit_counts.get(best_key, 0)
+                        enough_improvement = (conf_val - prev_best) >= OCR_BEST_MIN_IMPROVEMENT
+                        first_submit = submit_count == 0
+                        under_limit = submit_count < OCR_MAX_SUBMISSIONS_PER_FIELD
+                        if under_limit and (first_submit or enough_improvement):
                             job.ocr_best_conf[best_key] = conf_val
+                            job.ocr_submit_counts[best_key] = submit_count + 1
                             job.submitted_keys.discard(key)
                             job.pending_keys.discard(key)
                             should_submit = True
                             print(
                                 f"  [OCR-BEST] {field} owner#{owner_id} "
-                                f"conf={conf_val:.3f} > prev={prev_best:.3f}"
+                                f"conf={conf_val:.3f} prev={prev_best:.3f} "
+                                f"submit={submit_count + 1}/{OCR_MAX_SUBMISSIONS_PER_FIELD}"
                             )
-                elif key not in pending and key not in submitted:
+                elif frame_id % OCR_EVERY_N_FRAMES == 0 and key not in pending and key not in submitted:
                     should_submit = True
 
             if should_submit and job is not None:
+                assoc_snapshot = (
+                    {"truck_tid": truck_tid, "truck_type": truck_type, "field": field}
+                    if truck_tid is not None and truck_type is not None
+                    else None
+                )
                 _enqueue_ocr(
                     job.job_id, key,
                     _preprocess_crop(crop_bgr),
                     field, frame_id, truck_tid, truck_type,
                     track_id,  # Pass child track_id for lock lookup
                     conf=conf_val,
+                    assoc_snapshot=assoc_snapshot,
                 )
 
         # ── Gather HUD numbers including locking stats ────────────────────────
+        processed_frame_count += 1
+        processed_frame_ids.append(frame_id)
+        session_info["frames_processed"] = processed_frame_count
+        session_info["processed_frame_ids"] = processed_frame_ids
         n_cache   = len(cached)
         n_pending = len(pending)
         q_size    = _ocr_queue.qsize()
@@ -1351,7 +1511,11 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
 
         ok, jpeg = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         if ok and job is not None:
-            _set_job(job.job_id, latest_frame_jpeg=jpeg.tobytes())
+            _set_job(job.job_id, latest_frame_jpeg=jpeg.tobytes(), latest_frame_id=frame_id)
+        processed_frame_path = _save_processed_frame(job.job_id if job is not None else None, frame_id, annotated)
+        if processed_frame_path:
+            processed_frame_paths.append(processed_frame_path)
+            session_info["processed_frame_paths"] = processed_frame_paths
 
         t_now      = time.time()
         fps_smooth = 0.8 * fps_smooth + 0.2 * (1.0 / max(t_now - t_prev, 1e-6))
@@ -1379,7 +1543,9 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
 
     cap.release()
     session_info["finished_at"]      = datetime.now().isoformat(timespec="seconds")
-    session_info["frames_processed"] = frame_id
+    session_info["frames_processed"] = processed_frame_count
+    session_info["processed_frame_ids"] = processed_frame_ids
+    session_info["processed_frame_paths"] = processed_frame_paths
     final_data = registry.to_dict(session_info)
     if job is not None:
         _set_job(job.job_id, json_snapshot=json.dumps(final_data, indent=2))
@@ -1409,6 +1575,7 @@ def _run_job(job_id: str) -> None:
                 break
             _set_job(
                 job_id,
+                state="waiting_ocr",
                 message=f"Frames processed — waiting for {n_pending} OCR task(s) to complete…",
             )
             print(f"  [OCR-WAIT] {n_pending} task(s) still pending…")
@@ -1528,6 +1695,7 @@ def analyze_video_job_status(job_id: str) -> dict[str, Any]:
         "state":         job.state,
         "progress":      job.progress,
         "frame_id":      job.frame_id,
+        "latest_frame_id": job.latest_frame_id,
         "total_frames":  job.total_frames,
         "fps":           job.fps,
         "message":       job.message,
@@ -1559,8 +1727,3 @@ def analyze_video_job_frame(job_id: str) -> Response:
     if not job.latest_frame_jpeg:
         raise HTTPException(status_code=404, detail="No frame available yet.")
     return Response(content=job.latest_frame_jpeg, media_type="image/jpeg")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)

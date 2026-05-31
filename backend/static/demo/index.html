@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Logistics Terminal OS</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">O</div>
+        <div>
+          <div class="brand-name">Logistics</div>
+          <div class="brand-sub">Terminal OS</div>
+        </div>
+      </div>
+      <nav class="side-card">
+        <div class="nav-head">Gate <span>^</span></div>
+        <button class="nav-item active">Arrive Unit</button>
+        <button class="nav-item">Open EIR</button>
+        <button class="nav-item">Depart Unit</button>
+        <button class="nav-item">Inspect Units</button>
+        <button class="nav-item">EIR Search</button>
+        <button class="nav-item">Gensets</button>
+        <button class="nav-item">Stacked Chassis</button>
+        <button class="nav-item">Pre-Arrive</button>
+        <button class="nav-item">Pre-Arrive Admin</button>
+      </nav>
+      <div class="operator">
+        <div class="avatar">JD</div>
+        <div>
+          <strong>John Dispatcher</strong>
+          <span>Ops Director</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="shell">
+      <header class="topbar">
+        <span>Help & Support</span>
+        <span>Analytics</span>
+        <span>System Status <strong>Optimal</strong></span>
+      </header>
+
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Exit Terminal</div>
+          <h1>Gate Arrival <span>Registry</span></h1>
+          <div class="meta-grid">
+            <div>
+              <small>Run ID</small>
+              <strong id="runId">-</strong>
+            </div>
+            <div>
+              <small>Queue</small>
+              <strong id="queueState">Idle</strong>
+            </div>
+          </div>
+        </div>
+        <div id="message" class="message">Upload a video, then click Detect.</div>
+      </section>
+
+      <section class="workspace">
+        <aside class="info-panel">
+          <h2>Trucker Information</h2>
+          <p>Populated from model class fields</p>
+          <button id="toggleInfo" class="soft-btn">Hide</button>
+          <div id="infoFields" class="field-stack">
+            <div><span>Container Number</span><strong id="fContainer">-</strong></div>
+            <div><span>Side No</span><strong id="fSide">-</strong></div>
+            <div><span>License Plate</span><strong id="fPlate">-</strong></div>
+            <div><span>Truck Number</span><strong id="fTruck">-</strong></div>
+          </div>
+        </aside>
+
+        <section class="stream-card">
+          <div class="card-head">
+            <span class="pill">Demo Stream</span>
+            <button id="toggleStream" class="soft-btn small">Hide</button>
+          </div>
+          <div id="streamWrap" class="stream-wrap">
+            <div class="stream-box">
+              <img id="streamImage" alt="Processed detection frame" hidden />
+              <div id="streamEmpty">Video selected. Click Detect to process frames.</div>
+            </div>
+            <button id="pauseBtn" class="pause-btn">Pause</button>
+            <div id="statusBar" class="status idle"><span></span><strong>Awaiting Video Upload</strong></div>
+            <div class="upload-row">
+              <label class="single-upload">
+                <span>Upload Single Video</span>
+                <input id="singleVideo" type="file" accept="video/*" />
+              </label>
+              <button id="detectBtn" class="primary-btn">Detect</button>
+            </div>
+            <div class="camera-grid">
+              <label><strong>Front</strong><span id="frontName">No file</span><input data-camera="front" type="file" accept="video/*" /></label>
+              <label><strong>Right</strong><span id="rightName">No file</span><input data-camera="right" type="file" accept="video/*" /></label>
+              <label><strong>Back</strong><span id="backName">No file</span><input data-camera="back" type="file" accept="video/*" /></label>
+              <label><strong>Left</strong><span id="leftName">No file</span><input data-camera="left" type="file" accept="video/*" /></label>
+            </div>
+            <p class="hint">Select two to four camera videos to create one merged entity run.</p>
+            <details class="ocr-panel" open>
+              <summary>Live OCR Log</summary>
+              <div id="ocrLog" class="ocr-log"></div>
+            </details>
+          </div>
+        </section>
+      </section>
+
+      <section class="table-card">
+        <div class="table-head">
+          <h2>Real-Time Trucks Dashboard</h2>
+          <div class="chips">
+            <button class="chip active">Table</button>
+            <button class="chip">List</button>
+            <span class="chip">Detected: <strong id="detectedCount">0</strong></span>
+            <span class="chip">Approved: <strong id="approvedCount">0</strong></span>
+            <span class="chip">Rejected: <strong id="rejectedCount">0</strong></span>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Container Number</th>
+                <th>Container Side No</th>
+                <th>Driver</th>
+                <th>License Plate</th>
+                <th>Other Container Info</th>
+                <th>Truck Company</th>
+                <th>Truck Number</th>
+                <th>OCR Conf</th>
+                <th>Confidence Avg</th>
+                <th>Duration Sec</th>
+                <th>First Seen Time Sec</th>
+                <th>Last Seen Time Sec</th>
+                <th>First Seen Frame</th>
+                <th>Last Seen Frame</th>
+                <th>Last BBox</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="truckRows">
+              <tr><td colspan="16" class="empty-row">No detections yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

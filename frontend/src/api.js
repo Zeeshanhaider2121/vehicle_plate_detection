@@ -123,3 +123,7 @@ export async function finalizeMultiCamera(jobId) {
 export function getVideoTruckRunFrameUrl(jobId) {
   return `${API_BASE_URL}/api/truck-runs/video/${jobId}/frame`;
 }
+
+export function getMultiCameraFrameUrl(jobId, camera) {
+  return `${API_BASE_URL}/api/truck-runs/multi-camera/${jobId}/frame/${camera}`;
+}

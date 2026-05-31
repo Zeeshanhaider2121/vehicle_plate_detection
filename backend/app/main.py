@@ -1,12 +1,14 @@
 import json
 import re
+from pathlib import Path
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-import requests
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -35,15 +37,14 @@ from .schemas import (
     VideoAnalyzeStatusResponse,
     VerifyRequest,
 )
-from .video_client import ColabVideoClient
+from .video_client import LocalVideoService, LocalVideoServiceError
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
 inference_service = InferenceService()
-video_client = ColabVideoClient()
+video_service = LocalVideoService()
+DEMO_STATIC_DIR = Path(__file__).resolve().parents[1] / "static" / "demo"
+FRONTEND_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
-# Cache the last known good snapshot per job so the frontend
-# still gets data even after the Colab stub crashes.
-_last_good_snapshot: dict[str, str] = {}
 _multi_camera_jobs: dict[str, dict[str, Any]] = {}
 _video_demo_constraints: dict[str, dict[str, Any]] = {}
 
@@ -108,6 +109,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if DEMO_STATIC_DIR.exists():
+    app.mount("/demo", StaticFiles(directory=str(DEMO_STATIC_DIR), html=True), name="demo")
+
+if FRONTEND_DIST_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="frontend-assets")
 
 
 @app.on_event("startup")
@@ -685,7 +692,7 @@ def _merge_track_fragments(trucks: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _apply_fragment_merge_to_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    """Apply track-fragment merging to a raw Colab snapshot so the live view shows merged trucks."""
+    """Apply track-fragment merging to a raw inference snapshot so the live view shows merged trucks."""
     trucks_raw = payload.get("trucks") or {}
     if not trucks_raw:
         return payload
@@ -1007,7 +1014,7 @@ def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         environment=settings.app_env,
-        colab_inference_configured=bool(settings.colab_infer_url),
+        local_inference_enabled=True,
     )
 
 
@@ -1140,19 +1147,11 @@ async def upload_video_and_import(
             payload_dict = json.loads(raw_json.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise HTTPException(status_code=400, detail=f"Invalid analysis JSON file: {exc}") from exc
-    elif video_client.configured():
-        try:
-            payload_dict = video_client.analyze_video_sync(video_bytes, video.filename or "upload.mp4")
-        except Exception as exc:  # pragma: no cover
-            raise HTTPException(status_code=502, detail=f"Video analysis service failed: {exc}") from exc
     else:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No analysis JSON provided and COLAB_INFER_URL is not configured for "
-                "video analysis endpoint /analyze-video."
-            ),
-        )
+        try:
+            payload_dict = video_service.analyze_video_sync(video_bytes, video.filename or "upload.mp4")
+        except Exception as exc:  # pragma: no cover
+            raise HTTPException(status_code=502, detail=f"Video analysis failed: {exc}") from exc
 
     payload_dict.setdefault("session", {})
     payload_dict["session"].setdefault("video_path", video.filename)
@@ -1199,25 +1198,19 @@ async def start_video_job(
             stored_trucks=saved.stored_trucks,
         )
 
-    if not video_client.configured():
-        raise HTTPException(
-            status_code=400,
-            detail="COLAB_INFER_URL is not configured. Upload `analysis_json` or configure Colab API URL.",
-        )
-
     try:
-        data = video_client.start_video_job(video_bytes, video.filename or "upload.mp4")
+        data = video_service.start_video_job(video_bytes, video.filename or "upload.mp4")
     except Exception as exc:  # pragma: no cover
-        raise HTTPException(status_code=502, detail=f"Failed to start Colab video job: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"Failed to start video job: {exc}") from exc
 
     job_id = data.get("job_id")
     if not job_id:
-        raise HTTPException(status_code=502, detail=f"Invalid Colab response (missing job_id): {data}")
+        raise HTTPException(status_code=502, detail=f"Invalid local inference response (missing job_id): {data}")
     if constraints:
         _video_demo_constraints[job_id] = constraints
 
     return VideoAnalyzeStartResponse(
-        mode="colab_async",
+        mode="local_async",
         job_id=job_id,
         state=str(data.get("state", "queued")),
         message=str(data.get("message", "Video job submitted.")),
@@ -1226,31 +1219,17 @@ async def start_video_job(
 
 @app.get("/api/truck-runs/video/{job_id}/status", response_model=VideoAnalyzeStatusResponse)
 def get_video_job_status(job_id: str) -> VideoAnalyzeStatusResponse:
-    if not video_client.configured():
-        raise HTTPException(status_code=400, detail="COLAB_INFER_URL is not configured.")
-
-    # Try fetching from the Colab stub; if it fails, return the last known good snapshot.
     try:
-        data = video_client.get_video_job_status(job_id)
-    except Exception:  # pragma: no cover
-        cached = _last_good_snapshot.get(job_id)
-        if cached:
-            return VideoAnalyzeStatusResponse(
-                job_id=job_id,
-                state="cached",
-                progress=None,
-                json_snapshot=cached,
-                ocr_log=[],
-            )
-        raise HTTPException(status_code=502, detail="Colab stub is unavailable and no cached snapshot exists.")
+        data = video_service.get_video_job_status(job_id)
+    except LocalVideoServiceError as exc:
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
 
     snap = data.get("json_snapshot")
     ocr = data.get("ocr_log") or []
     if snap and len(snap) > 50:
-        _last_good_snapshot[job_id] = snap
         import json as _json
         try:
-            snap_path = f"colab_log_{job_id[:8]}_snapshot.json"
+            snap_path = f"local_video_log_{job_id[:8]}_snapshot.json"
             with open(snap_path, "w") as f:
                 parsed = _json.loads(snap)
                 _json.dump(parsed, f, indent=2, default=str)
@@ -1270,6 +1249,7 @@ def get_video_job_status(job_id: str) -> VideoAnalyzeStatusResponse:
         state=str(data.get("state", "unknown")),
         progress=float(data["progress"]) if data.get("progress") is not None else None,
         frame_id=int(data["frame_id"]) if data.get("frame_id") is not None else None,
+        latest_frame_id=int(data["latest_frame_id"]) if data.get("latest_frame_id") is not None else None,
         total_frames=int(data["total_frames"]) if data.get("total_frames") is not None else None,
         fps=float(data["fps"]) if data.get("fps") is not None else None,
         message=data.get("message"),
@@ -1280,20 +1260,19 @@ def get_video_job_status(job_id: str) -> VideoAnalyzeStatusResponse:
 
 @app.post("/api/truck-runs/video/{job_id}/finalize", response_model=VideoAnalyzeFinalizeResponse)
 def finalize_video_job(job_id: str, db: Session = Depends(get_db)) -> VideoAnalyzeFinalizeResponse:
-    if not video_client.configured():
-        raise HTTPException(status_code=400, detail="COLAB_INFER_URL is not configured.")
-
     try:
-        data = video_client.get_video_job_result(job_id)
+        data = video_service.get_video_job_result(job_id)
+    except LocalVideoServiceError as exc:
+        raise HTTPException(status_code=exc.status_code or 502, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=502, detail=f"Failed to fetch job result: {exc}") from exc
 
     import json as _json
-    final_path = f"colab_log_{job_id[:8]}_final.json"
+    final_path = f"local_video_log_{job_id[:8]}_final.json"
     with open(final_path, "w") as f:
         _json.dump(data, f, indent=2, default=str)
     print(f"\n{'#'*70}")
-    print(f"### RAW COLAB FINALIZE RESPONSE → {final_path} ###")
+    print(f"### RAW LOCAL VIDEO FINALIZE RESPONSE -> {final_path} ###")
     print(f"{'#'*70}")
 
     payload_dict = data.get("result", data)
@@ -1301,7 +1280,7 @@ def finalize_video_job(job_id: str, db: Session = Depends(get_db)) -> VideoAnaly
     try:
         payload = TruckRunImportRequest.model_validate(payload_dict)
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid Colab job result payload: {exc}") from exc
+        raise HTTPException(status_code=422, detail=f"Invalid video job result payload: {exc}") from exc
 
     saved = _store_truck_run(payload, db)
     state = str(data.get("state", "completed"))
@@ -1315,16 +1294,13 @@ def finalize_video_job(job_id: str, db: Session = Depends(get_db)) -> VideoAnaly
 
 @app.get("/api/truck-runs/video/{job_id}/frame")
 def get_video_job_frame(job_id: str) -> Response:
-    if not video_client.configured():
-        raise HTTPException(status_code=400, detail="COLAB_INFER_URL is not configured.")
     try:
-        frame_bytes, content_type = video_client.get_video_job_frame(job_id)
-    except requests.HTTPError as exc:  # pragma: no cover
-        code = exc.response.status_code if exc.response is not None else None
-        # Colab may return 404/409 while frame is not ready yet; don't surface as hard error.
+        frame_bytes, content_type = video_service.get_video_job_frame(job_id)
+    except LocalVideoServiceError as exc:
+        code = exc.status_code
         if code in (404, 409):
             return Response(status_code=204)
-        raise HTTPException(status_code=502, detail=f"Failed to fetch job frame: upstream HTTP {code}") from exc
+        raise HTTPException(status_code=code or 502, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=502, detail=f"Failed to fetch job frame: {exc}") from exc
     return Response(content=frame_bytes, media_type=content_type)
@@ -1338,9 +1314,6 @@ async def start_multi_camera_job(
     left: UploadFile | None = File(default=None),
     demo_constraints: UploadFile | None = File(default=None),
 ) -> MultiCameraAnalyzeStartResponse:
-    if not video_client.configured():
-        raise HTTPException(status_code=400, detail="COLAB_INFER_URL is not configured.")
-
     uploads = {"front": front, "right": right, "back": back, "left": left}
     selected = {camera: upload for camera, upload in uploads.items() if upload is not None}
     if len(selected) < 2:
@@ -1357,7 +1330,7 @@ async def start_multi_camera_job(
             raise HTTPException(status_code=400, detail=f"{camera} video is empty.")
         filename = f"{camera}_{upload.filename or 'upload.mp4'}"
         try:
-            data = video_client.start_video_job(raw, filename)
+            data = video_service.start_video_job(raw, filename)
         except Exception as exc:  # pragma: no cover
             raise HTTPException(status_code=502, detail=f"Failed to start {camera} camera job: {exc}") from exc
         child_job_id = data.get("job_id")
@@ -1407,7 +1380,12 @@ def get_multi_camera_job_status(job_id: str) -> MultiCameraAnalyzeStatusResponse
     for camera, meta in job["cameras"].items():
         child_job_id = meta["job_id"]
         try:
-            data = video_client.get_video_job_status(child_job_id)
+            data = video_service.get_video_job_status(child_job_id)
+        except LocalVideoServiceError as exc:
+            data = {
+                "state": "unknown",
+                "message": f"Unable to fetch {camera} status: {exc}",
+            }
         except Exception as exc:  # pragma: no cover
             data = {
                 "state": "unknown",
@@ -1434,6 +1412,7 @@ def get_multi_camera_job_status(job_id: str) -> MultiCameraAnalyzeStatusResponse
                 state=state,
                 progress=float(data["progress"]) if data.get("progress") is not None else None,
                 frame_id=int(data["frame_id"]) if data.get("frame_id") is not None else None,
+                latest_frame_id=int(data["latest_frame_id"]) if data.get("latest_frame_id") is not None else None,
                 total_frames=int(data["total_frames"]) if data.get("total_frames") is not None else None,
                 fps=float(data["fps"]) if data.get("fps") is not None else None,
                 message=data.get("message"),
@@ -1471,7 +1450,12 @@ def finalize_multi_camera_job(
     for camera, meta in job["cameras"].items():
         child_job_id = meta["job_id"]
         try:
-            data = video_client.get_video_job_result(child_job_id)
+            data = video_service.get_video_job_result(child_job_id)
+        except LocalVideoServiceError as exc:
+            raise HTTPException(
+                status_code=exc.status_code or 502,
+                detail=f"Failed to fetch {camera} result: {exc}",
+            ) from exc
         except Exception as exc:  # pragma: no cover
             raise HTTPException(status_code=502, detail=f"Failed to fetch {camera} result: {exc}") from exc
         child_states.append(str(data.get("state", "completed")))
@@ -1508,12 +1492,12 @@ def get_multi_camera_job_frame(job_id: str, camera: str) -> Response:
         raise HTTPException(status_code=404, detail="Camera not found for this job.")
     child_job_id = job["cameras"][camera]["job_id"]
     try:
-        frame_bytes, content_type = video_client.get_video_job_frame(child_job_id)
-    except requests.HTTPError as exc:  # pragma: no cover
-        code = exc.response.status_code if exc.response is not None else None
+        frame_bytes, content_type = video_service.get_video_job_frame(child_job_id)
+    except LocalVideoServiceError as exc:
+        code = exc.status_code
         if code in (404, 409):
             return Response(status_code=204)
-        raise HTTPException(status_code=502, detail=f"Failed to fetch {camera} frame: upstream HTTP {code}") from exc
+        raise HTTPException(status_code=code or 502, detail=f"Failed to fetch {camera} frame: {exc}") from exc
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=502, detail=f"Failed to fetch {camera} frame: {exc}") from exc
     return Response(content=frame_bytes, media_type=content_type)
@@ -1560,3 +1544,15 @@ def list_truck_records(
         items=[_truck_record_to_read(item) for item in items],
         total=total,
     )
+
+
+if FRONTEND_DIST_DIR.exists():
+    _frontend_index = str(FRONTEND_DIST_DIR / "index.html")
+
+    @app.get("/")
+    async def serve_frontend_root() -> FileResponse:
+        return FileResponse(_frontend_index)
+
+    @app.get("/{full_path:path}")
+    async def serve_frontend(full_path: str) -> FileResponse:
+        return FileResponse(_frontend_index)

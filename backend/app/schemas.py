@@ -46,7 +46,7 @@ class RejectRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     environment: str
-    colab_inference_configured: bool
+    local_inference_enabled: bool
 
 
 class InferenceRecord(BaseModel):
@@ -158,6 +158,7 @@ class VideoAnalyzeStatusResponse(BaseModel):
     state: str
     progress: float | None = None
     frame_id: int | None = None
+    latest_frame_id: int | None = None
     total_frames: int | None = None
     fps: float | None = None
     message: str | None = None
@@ -178,6 +179,7 @@ class MultiCameraChildStatus(BaseModel):
     state: str = "unknown"
     progress: float | None = None
     frame_id: int | None = None
+    latest_frame_id: int | None = None
     total_frames: int | None = None
     fps: float | None = None
     message: str | None = None

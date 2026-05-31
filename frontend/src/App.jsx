@@ -3,6 +3,7 @@ import {
   fetchTruckRecords,
   finalizeMultiCamera,
   finalizeVideoTruckRun,
+  getMultiCameraFrameUrl,
   getMultiCameraStatus,
   getVideoTruckRunFrameUrl,
   getVideoTruckRunStatus,
@@ -139,7 +140,7 @@ function stripOcrMarkdown(value) {
 function normalizeTruckFromSnapshot(trackId, truck) {
   const safeTrackId = Number(trackId ?? truck?.tid ?? truck?.track_id);
 
-  // The real Colab server returns { tid, type, first, last, conf, info }
+  // The inference snapshot returns { tid, type, first, last, conf, info }
   // rather than { track_id, type, first_seen_frame, ... associated_info }
   const rawInfo = truck?.info || truck?.associated_info || {};
   const cleanedInfo = {};
@@ -196,6 +197,9 @@ export default function App() {
   const [camFiles, setCamFiles] = useState({ front: null, right: null, back: null, left: null });
   const [videoZoom, setVideoZoom] = useState(1);
   const videoRef = useRef(null);
+  const streamFrameLoadingRef = useRef(false);
+  const lastRequestedFrameRef = useRef("");
+  const hasSelectedVideo = Boolean(videoFile || Object.values(camFiles).some(Boolean));
 
   function toggleVideo() {
     if (!videoRef.current) return;
@@ -229,6 +233,7 @@ export default function App() {
   }, [detectedTrucks]);
 
   const pendingCount = counts.pending;
+  const selectedCameraCount = Object.values(camFiles).filter(Boolean).length;
 
   const displayRows = useMemo(() => {
     if (!groupByField) return detectedTrucks;
@@ -346,10 +351,14 @@ export default function App() {
 
       const total = status.total_frames ?? "?";
       const frame = status.frame_id ?? 0;
+      const latestFrame = status.latest_frame_id ?? frame;
       const pct = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
-      setMessage(`Job ${jobId.slice(0, 8)} | ${status.state} | ${frame}/${total} | ${pct}`);
-      if (frame > 0) {
-        setStreamFrameUrl(`${getVideoTruckRunFrameUrl(jobId)}?ts=${Date.now()}`);
+      setMessage(`Job ${jobId.slice(0, 8)} | ${status.state} | ${frame}/${total} | shown ${latestFrame} | ${pct}`);
+      const frameKey = `single:${latestFrame}`;
+      if (latestFrame > 0 && frameKey !== lastRequestedFrameRef.current && !streamFrameLoadingRef.current) {
+        streamFrameLoadingRef.current = true;
+        lastRequestedFrameRef.current = frameKey;
+        setStreamFrameUrl(`${getVideoTruckRunFrameUrl(jobId)}?frame=${latestFrame}&ts=${Date.now()}`);
       }
       if (status.ocr_log && status.ocr_log.length > 0) {
         setOcrLog((prev) => {
@@ -373,7 +382,7 @@ export default function App() {
       if (status.state === "cached") {
         cachedPolls += 1;
         if (cachedPolls > maxCachedPolls) {
-          throw new Error("Colab stub is down; last cached snapshot is shown above.");
+          throw new Error("Local inference service is unavailable; last cached snapshot is shown above.");
         }
         await sleep(2000);
         continue;
@@ -403,6 +412,21 @@ export default function App() {
       retries = 0;
       const progress = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
       setMessage(`Multi-camera ${jobId.slice(0, 8)} | ${status.state} | ${progress}`);
+      const streamCamera = (status.cameras || []).find((camera) => {
+        const latestFrame = camera.latest_frame_id ?? camera.frame_id ?? 0;
+        return latestFrame > 0;
+      });
+      if (streamCamera && !streamFrameLoadingRef.current) {
+        const latestFrame = streamCamera.latest_frame_id ?? streamCamera.frame_id ?? 0;
+        const frameKey = `${streamCamera.camera}:${latestFrame}`;
+        if (frameKey !== lastRequestedFrameRef.current) {
+          streamFrameLoadingRef.current = true;
+          lastRequestedFrameRef.current = frameKey;
+          setStreamFrameUrl(
+            `${getMultiCameraFrameUrl(jobId, streamCamera.camera)}?frame=${latestFrame}&ts=${Date.now()}`
+          );
+        }
+      }
       if (status.ocr_log && status.ocr_log.length > 0) {
         setOcrLog((prev) => {
           const combined = [...prev, ...status.ocr_log];
@@ -423,6 +447,7 @@ export default function App() {
   }
 
   async function handleVideoUpload() {
+    const useMultiCamera = selectedCameraCount >= 2;
     setLoading(true);
     setMessage("");
     setProcessStatus("uploading");
@@ -432,13 +457,15 @@ export default function App() {
       setReviewIndex(0);
       setActiveJobId("");
       setStreamFrameUrl("");
+      streamFrameLoadingRef.current = false;
+      lastRequestedFrameRef.current = "";
       setStreamWarning("");
       setStreamErrorCount(0);
 
       let currentRunId;
       let storedTrucks = 0;
 
-      if (multiCamMode) {
+      if (useMultiCamera) {
         const selected = Object.fromEntries(
           Object.entries(camFiles).filter(([, f]) => f != null)
         );
@@ -455,7 +482,6 @@ export default function App() {
         const finalized = await finalizeMultiCamera(aggregateJobId);
         currentRunId = finalized.run_id;
         storedTrucks = finalized.stored_trucks;
-        setActiveJobId("");
       } else {
         if (!videoFile) {
           setMessage("Please select a video file.");
@@ -470,13 +496,12 @@ export default function App() {
           const jobId = start.job_id;
           if (!jobId) throw new Error("Missing job_id from backend.");
           setActiveJobId(jobId);
-          setMessage(`Video job started (${jobId.slice(0, 8)}). Processing on Colab GPU...`);
+          setMessage(`Video job started (${jobId.slice(0, 8)}). Processing locally...`);
           setProcessStatus("processing");
           await pollJobUntilComplete(jobId);
           const finalized = await finalizeVideoTruckRun(jobId);
           currentRunId = finalized.run_id;
           storedTrucks = finalized.stored_trucks;
-          setActiveJobId("");
         }
       }
 
@@ -722,6 +747,7 @@ export default function App() {
                     className="stream-image"
                     style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
                     onError={() => {
+                      streamFrameLoadingRef.current = false;
                       const next = streamErrorCount + 1;
                       setStreamErrorCount(next);
                       if (next >= 3) {
@@ -731,21 +757,15 @@ export default function App() {
                       }
                     }}
                     onLoad={() => {
+                      streamFrameLoadingRef.current = false;
                       if (streamWarning) setStreamWarning("");
                       if (streamErrorCount > 0) setStreamErrorCount(0);
                     }}
                   />
+                ) : hasSelectedVideo ? (
+                  <div className="stream-empty">Video selected. Click Detect to process frames.</div>
                 ) : (
-                  <video
-                    ref={videoRef}
-                    className="stream-video"
-                    style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
-                    autoPlay
-                    muted
-                    loop
-                    playsInline
-                    src="http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-                  />
+                  <div className="stream-empty">Upload a video to process frames.</div>
                 )}
               </div>
               <div className="stream-controls">
@@ -769,33 +789,40 @@ export default function App() {
               </div>
               <div className="stream-upload-row">
                 <label className="upload-label">
-                  {multiCamMode ? "Multi-Camera" : "Upload Video"}
+                  Upload Video
                   <input
                     type="file"
-                    accept={multiCamMode ? undefined : "video/*"}
+                    accept="video/*"
                     onChange={(event) => setVideoFile(event.target.files?.[0] || null)}
-                    style={multiCamMode ? { display: "none" } : {}}
                   />
                 </label>
                 <label className="cam-toggle-label">
                   <input type="checkbox" checked={multiCamMode} onChange={() => setMultiCamMode((v) => !v)} />
                   {" "}Multi-Cam
                 </label>
-                {multiCamMode && (
-                  <div className="cam-uploads">
-                    {["front", "right", "back", "left"].map((cam) => (
-                      <label key={cam} className="cam-upload-label">
-                        {cam}
-                        <input type="file" accept="video/*"
-                          onChange={(e) => setCamFiles((prev) => ({ ...prev, [cam]: e.target.files?.[0] || null }))}
-                        />
-                      </label>
-                    ))}
-                  </div>
-                )}
                 <button type="button" className="detect-btn" onClick={handleVideoUpload} disabled={loading}>
                   {loading ? "Detecting..." : "Detect"}
                 </button>
+              </div>
+              <div className="cam-uploads">
+                {["front", "right", "back", "left"].map((cam) => (
+                  <label key={cam} className={camFiles[cam] ? "cam-upload-label has-file" : "cam-upload-label"}>
+                    <span>{cam}</span>
+                    <small>{camFiles[cam]?.name || "No file"}</small>
+                    <input
+                      type="file"
+                      accept="video/*"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0] || null;
+                        setCamFiles((prev) => ({ ...prev, [cam]: file }));
+                        if (file) setMultiCamMode(true);
+                      }}
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="multi-upload-note">
+                Select at least two camera videos. The dashboard will use multi-camera mode automatically.
               </div>
               {ocrLog.length > 0 && (
                 <div className="ocr-log-panel">

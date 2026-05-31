@@ -1,122 +1,57 @@
 from __future__ import annotations
 
-import hashlib
+import tempfile
+from pathlib import Path
 from typing import Any
 
-import requests
+import local_inference
 
-from .config import settings
 from .schemas import InferenceRecord
-
-
-def _pick_first(payload: dict[str, Any], keys: list[str]) -> Any:
-    for key in keys:
-        if key in payload:
-            return payload[key]
-    return None
-
-
-def _parse_plate_text(raw: dict[str, Any]) -> str:
-    text = _pick_first(
-        raw,
-        ["plate_text", "plate", "license_plate", "licensePlate", "text", "prediction"],
-    )
-    if text is None:
-        return "UNKNOWN"
-    return str(text).strip().upper() or "UNKNOWN"
-
-
-def _parse_confidence(raw: dict[str, Any]) -> float | None:
-    confidence = _pick_first(raw, ["confidence", "score", "probability"])
-    if confidence is None:
-        return None
-
-    try:
-        value = float(confidence)
-    except (TypeError, ValueError):
-        return None
-
-    if value < 0:
-        return 0.0
-    if value > 1:
-        return 1.0
-    return round(value, 4)
-
-
-def _parse_bbox(raw: dict[str, Any]) -> dict[str, Any] | list[Any] | None:
-    return _pick_first(raw, ["bbox", "box", "xyxy", "rect"])
-
-
-def _extract_detections(payload: dict[str, Any]) -> list[InferenceRecord]:
-    raw_detections: Any = _pick_first(payload, ["detections", "predictions", "results"])
-
-    if raw_detections is None and "plate_text" in payload:
-        raw_detections = [payload]
-
-    if not isinstance(raw_detections, list):
-        return []
-
-    output: list[InferenceRecord] = []
-    for item in raw_detections:
-        if not isinstance(item, dict):
-            continue
-
-        output.append(
-            InferenceRecord(
-                plate_text=_parse_plate_text(item),
-                confidence=_parse_confidence(item),
-                bbox=_parse_bbox(item),
-            )
-        )
-    return output
-
-
-def _mock_detections(image_bytes: bytes, source_name: str | None) -> list[InferenceRecord]:
-    digest = hashlib.sha256(image_bytes).hexdigest()
-    seed = int(digest[:8], 16)
-    suffix = seed % 9000 + 1000
-    confidence = 0.7 + ((seed % 30) / 100)
-    detection = InferenceRecord(
-        plate_text=f"TEST{suffix}",
-        confidence=min(round(confidence, 3), 0.99),
-        bbox={"x1": 120, "y1": 220, "x2": 320, "y2": 300},
-    )
-
-    extra: list[InferenceRecord] = []
-    if source_name and seed % 2 == 0:
-        extra.append(
-            InferenceRecord(
-                plate_text=f"ALT{(suffix + 7) % 9999:04d}",
-                confidence=min(round(confidence - 0.12, 3), 0.95),
-                bbox={"x1": 340, "y1": 230, "x2": 520, "y2": 305},
-            )
-        )
-
-    return [detection, *extra]
 
 
 class InferenceService:
     def infer(self, image_bytes: bytes, source_name: str | None) -> tuple[list[InferenceRecord], dict[str, Any], bool]:
-        if settings.colab_infer_url:
-            try:
-                infer_url = f"{settings.colab_infer_url.rstrip('/')}{settings.colab_infer_path}"
-                response = requests.post(
-                    infer_url,
-                    files={"file": (source_name or "upload.jpg", image_bytes, "application/octet-stream")},
-                    timeout=settings.inference_timeout_seconds,
-                )
-                response.raise_for_status()
-                payload: dict[str, Any] = response.json()
-                detections = _extract_detections(payload)
-                if detections:
-                    return detections, payload, False
-                if not settings.mock_inference_if_unavailable:
-                    raise ValueError("No detections in response payload")
-            except Exception as exc:  # pragma: no cover
-                if not settings.mock_inference_if_unavailable:
-                    raise RuntimeError(f"Inference call failed: {exc}") from exc
-                payload = {"mock_fallback_reason": str(exc)}
-                return _mock_detections(image_bytes, source_name), payload, True
+        with tempfile.TemporaryDirectory(prefix="plateflow_image_") as tmp_dir:
+            image_path = Path(tmp_dir) / (source_name or "upload.jpg")
+            image_path.write_bytes(image_bytes)
+            results = local_inference.model.predict(
+                str(image_path),
+                verbose=False,
+                conf=local_inference.CONF,
+                iou=local_inference.IOU_THRESH,
+                half=local_inference.USE_HALF,
+                device=local_inference.DEVICE,
+            )
 
-        payload = {"mock_fallback_reason": "COLAB_INFER_URL not configured"}
-        return _mock_detections(image_bytes, source_name), payload, True
+        detections: list[InferenceRecord] = []
+        if results:
+            names = results[0].names or {}
+            boxes = results[0].boxes
+            if boxes is not None:
+                for det_index in range(len(boxes)):
+                    cls_id = int(boxes.cls[det_index].item())
+                    conf_val = float(boxes.conf[det_index].item())
+                    cls_name = str(names.get(cls_id, f"class_{cls_id}"))
+                    if cls_name in local_inference.TRUCK_CLASSES and conf_val < local_inference.TRUCK_CONF_THRESH:
+                        continue
+                    xyxy = boxes.xyxy[det_index].tolist()
+                    detections.append(
+                        InferenceRecord(
+                            plate_text=cls_name,
+                            confidence=round(conf_val, 4),
+                            bbox={
+                                "x1": round(float(xyxy[0]), 2),
+                                "y1": round(float(xyxy[1]), 2),
+                                "x2": round(float(xyxy[2]), 2),
+                                "y2": round(float(xyxy[3]), 2),
+                            },
+                        )
+                    )
+
+        payload: dict[str, Any] = {
+            "detections": [item.model_dump() for item in detections],
+            "filename": source_name,
+            "device": local_inference.DEVICE,
+            "model": local_inference.MODEL_PATH,
+        }
+        return detections, payload, False

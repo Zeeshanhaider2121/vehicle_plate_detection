@@ -1,64 +1,80 @@
 from __future__ import annotations
 
+import tempfile
+import threading
+import uuid
+from pathlib import Path
 from typing import Any
 
-import requests
-
-from .config import settings
+import local_inference
 
 
-class ColabVideoClient:
-    def __init__(self) -> None:
-        self.base_url = (settings.colab_infer_url or "").rstrip("/")
+class LocalVideoServiceError(RuntimeError):
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
-    def configured(self) -> bool:
-        return bool(self.base_url)
 
-    def _url(self, path: str) -> str:
-        return f"{self.base_url}{path}"
+class LocalVideoService:
+    """In-process video inference service used by the main FastAPI app."""
 
     def analyze_video_sync(self, video_bytes: bytes, filename: str) -> dict[str, Any]:
-        response = requests.post(
-            self._url(settings.colab_analyze_video_path),
-            files={"file": (filename, video_bytes, "video/mp4")},
-            timeout=max(settings.video_job_timeout_seconds, settings.inference_timeout_seconds),
-        )
-        response.raise_for_status()
-        return response.json()
+        with tempfile.TemporaryDirectory(prefix="plateflow_sync_") as tmp_dir:
+            video_path = Path(tmp_dir) / filename
+            video_path.write_bytes(video_bytes)
+            return local_inference._run_video_analysis(str(video_path), job=None)
 
     def start_video_job(self, video_bytes: bytes, filename: str) -> dict[str, Any]:
-        response = requests.post(
-            self._url(settings.colab_start_video_job_path),
-            files={"file": (filename, video_bytes, "video/mp4")},
-            timeout=max(settings.inference_timeout_seconds, 300),
-        )
-        response.raise_for_status()
-        return response.json()
+        job_id = uuid.uuid4().hex
+        tmp_dir = tempfile.mkdtemp(prefix="plateflow_job_")
+        video_path = Path(tmp_dir) / filename
+        video_path.write_bytes(video_bytes)
+
+        with local_inference._jobs_lock:
+            local_inference.JOBS[job_id] = local_inference.VideoJob(
+                job_id=job_id,
+                state="queued",
+                message="Job queued.",
+                temp_video_path=str(video_path),
+            )
+        threading.Thread(target=local_inference._run_job, args=(job_id,), daemon=True).start()
+        return {"job_id": job_id, "state": "queued", "message": "Video job created."}
 
     def get_video_job_status(self, job_id: str) -> dict[str, Any]:
-        path = settings.colab_video_job_status_path_template.format(job_id=job_id)
-        response = requests.get(
-            self._url(path),
-            timeout=max(settings.inference_timeout_seconds, 60),
-        )
-        response.raise_for_status()
-        return response.json()
+        with local_inference._jobs_lock:
+            job = local_inference.JOBS.get(job_id)
+        if job is None:
+            raise LocalVideoServiceError("Job not found.", status_code=404)
+        return {
+            "job_id": job.job_id,
+            "state": job.state,
+            "progress": job.progress,
+            "frame_id": job.frame_id,
+            "latest_frame_id": job.latest_frame_id,
+            "total_frames": job.total_frames,
+            "fps": job.fps,
+            "message": job.message,
+            "error": job.error,
+            "ocr_log": job.ocr_log[-20:],
+            "json_snapshot": job.json_snapshot,
+        }
 
     def get_video_job_result(self, job_id: str) -> dict[str, Any]:
-        path = settings.colab_video_job_result_path_template.format(job_id=job_id)
-        response = requests.get(
-            self._url(path),
-            timeout=max(settings.inference_timeout_seconds, 120),
-        )
-        response.raise_for_status()
-        return response.json()
+        with local_inference._jobs_lock:
+            job = local_inference.JOBS.get(job_id)
+        if job is None:
+            raise LocalVideoServiceError("Job not found.", status_code=404)
+        if job.state == "failed":
+            raise LocalVideoServiceError(job.error or "Job failed.", status_code=500)
+        if job.state != "completed" or job.result is None:
+            raise LocalVideoServiceError("Job is not completed yet.", status_code=409)
+        return {"job_id": job.job_id, "state": job.state, "result": job.result}
 
     def get_video_job_frame(self, job_id: str) -> tuple[bytes, str]:
-        path = settings.colab_video_job_frame_path_template.format(job_id=job_id)
-        response = requests.get(
-            self._url(path),
-            timeout=max(settings.inference_timeout_seconds, 60),
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "image/jpeg")
-        return response.content, content_type
+        with local_inference._jobs_lock:
+            job = local_inference.JOBS.get(job_id)
+        if job is None:
+            raise LocalVideoServiceError("Job not found.", status_code=404)
+        if not job.latest_frame_jpeg:
+            raise LocalVideoServiceError("No frame available yet.", status_code=404)
+        return job.latest_frame_jpeg, "image/jpeg"
