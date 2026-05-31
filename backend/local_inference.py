@@ -77,12 +77,12 @@ USE_HALF          = True
 OCR_WORKERS       = 3
 SAVE_CROPS        = False
 SAVE_DETECTION_CROPS = _env_bool("SAVE_DETECTION_CROPS", True)
-SAVE_PROCESSED_FRAMES = _env_bool("SAVE_PROCESSED_FRAMES", True)
-OCR_BEST_MIN_IMPROVEMENT = _env_float("OCR_BEST_MIN_IMPROVEMENT", 0.08)
-OCR_MAX_SUBMISSIONS_PER_FIELD = _env_int("OCR_MAX_SUBMISSIONS_PER_FIELD", 3)
-DUPLICATE_FRAME_SKIP = _env_bool("DUPLICATE_FRAME_SKIP", True)
-DUPLICATE_FRAME_STABLE_COUNT = _env_int("DUPLICATE_FRAME_STABLE_COUNT", 3)
-DUPLICATE_FRAME_DIFF_THRESH = _env_float("DUPLICATE_FRAME_DIFF_THRESH", 1.5)
+SAVE_PROCESSED_FRAMES = False
+OCR_BEST_MIN_IMPROVEMENT = None
+OCR_MAX_SUBMISSIONS_PER_FIELD = None
+DUPLICATE_FRAME_SKIP         = False
+DUPLICATE_FRAME_STABLE_COUNT = 3    # kept but inactive
+DUPLICATE_FRAME_DIFF_THRESH  = 1.5  # kept but inactive
 MIN_ASSOC_SCORE   = 0.10
 MIN_TRUCK_AREA    = 40_000
 MIN_TRUCK_TRACK_FRAMES = _env_int("MIN_TRUCK_TRACK_FRAMES", 3)
@@ -117,7 +117,6 @@ OCR_CLASSES = {
     "truck_number",
     "container_company_logo",
     "truck_company",
-    "driver",
     "other_container_info",
 }
 TRUCK_WITH_CONTAINER_FIELDS = {
@@ -128,7 +127,6 @@ TRUCK_WITH_CONTAINER_FIELDS = {
 }
 TRUCK_WITHOUT_CONTAINER_FIELDS = {
     "license_plate",
-    "driver",
     "truck_company",
     "truck_number",
 }
@@ -369,7 +367,7 @@ def _update_association_votes(
         return
 
     votes = job.child_assoc_votes.setdefault(track_id, {})
-    key = (truck_tid, truck_type, cls_name)
+    key = (truck_tid, truck_type)
     votes[key] = votes.get(key, 0) + 1
     best_key = max(votes, key=lambda k: votes[k])
     best_count = votes[best_key]
@@ -379,9 +377,9 @@ def _update_association_votes(
 
     if best_count >= LOCK_AFTER_N_FRAMES:
         job.child_to_truck[track_id] = {
-            "truck_tid": best_key[0],
+            "truck_tid":  best_key[0],
             "truck_type": best_key[1],
-            "field": best_key[2],
+            "field":      cls_name,     # still store field from parameter
         }
         del job.child_assoc_votes[track_id]
         print(f"  [LOCKED] ✅ child T#{track_id} ({cls_name}) "
@@ -524,7 +522,6 @@ class TruckRegistry:
         "container_side_no": None,
         "container_company_logo": None,
         "other_container_info": None,
-        "driver": None,
         "license_plate": None,
         "truck_company": None,
         "truck_number": None,
@@ -1404,12 +1401,6 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             truck_tid, truck_type, field = None, None, cls_name
             if i in assoc_map:
                 truck_tid, truck_type, field = assoc_map[i]
-            elif job is not None:
-                fallback_tid = registry.find_truck_for_field(field, current_frame=frame_id)
-                if fallback_tid is not None:
-                    rec = registry.trucks.get(fallback_tid)
-                    truck_tid = fallback_tid
-                    truck_type = rec["type"] if rec else None
 
             # Use truck-field-scoped key when we have a truck association
             key = _det_key(track_id, frame_id, i, truck_tid, field)
@@ -1427,9 +1418,17 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     with _jobs_lock:
                         prev_best = job.ocr_best_conf.get(best_key, 0.0)
                         submit_count = job.ocr_submit_counts.get(best_key, 0)
-                        enough_improvement = (conf_val - prev_best) >= OCR_BEST_MIN_IMPROVEMENT
+                        enough_improvement = (
+                            True
+                            if OCR_BEST_MIN_IMPROVEMENT is None
+                            else (conf_val - prev_best) >= OCR_BEST_MIN_IMPROVEMENT
+                        )
                         first_submit = submit_count == 0
-                        under_limit = submit_count < OCR_MAX_SUBMISSIONS_PER_FIELD
+                        under_limit = (
+                            True
+                            if OCR_MAX_SUBMISSIONS_PER_FIELD is None
+                            else submit_count < OCR_MAX_SUBMISSIONS_PER_FIELD
+                        )
                         if under_limit and (first_submit or enough_improvement):
                             job.ocr_best_conf[best_key] = conf_val
                             job.ocr_submit_counts[best_key] = submit_count + 1
@@ -1445,11 +1444,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     should_submit = True
 
             if should_submit and job is not None:
-                assoc_snapshot = (
-                    {"truck_tid": truck_tid, "truck_type": truck_type, "field": field}
-                    if truck_tid is not None and truck_type is not None
-                    else None
-                )
+                assoc_snapshot = None   # always None
                 _enqueue_ocr(
                     job.job_id, key,
                     _preprocess_crop(crop_bgr),
