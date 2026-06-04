@@ -24,7 +24,7 @@ class LocalVideoService:
             video_path.write_bytes(video_bytes)
             return local_inference._run_video_analysis(str(video_path), job=None)
 
-    def start_video_job(self, video_bytes: bytes, filename: str) -> dict[str, Any]:
+    def start_video_job(self, video_bytes: bytes, filename: str, camera_label: str = "") -> dict[str, Any]:
         job_id = uuid.uuid4().hex
         tmp_dir = tempfile.mkdtemp(prefix="plateflow_job_")
         video_path = Path(tmp_dir) / filename
@@ -36,6 +36,7 @@ class LocalVideoService:
                 state="queued",
                 message="Job queued.",
                 temp_video_path=str(video_path),
+                camera_source=camera_label,
             )
         threading.Thread(target=local_inference._run_job, args=(job_id,), daemon=True).start()
         return {"job_id": job_id, "state": "queued", "message": "Video job created."}
@@ -50,7 +51,6 @@ class LocalVideoService:
             "state": job.state,
             "progress": job.progress,
             "frame_id": job.frame_id,
-            "latest_frame_id": job.latest_frame_id,
             "total_frames": job.total_frames,
             "fps": job.fps,
             "message": job.message,

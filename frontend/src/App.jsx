@@ -57,15 +57,66 @@ const menuItems = [
   "Pre-Arrive Admin"
 ];
 
+function cleanOcrText(text) {
+  if (text === null || text === undefined) return text;
+  // Strip decorative '#' and '$' characters that leak in from OCR / markdown
+  // (e.g. "# CA-40761" -> "CA-40761", "## REAR" -> "REAR"), then collapse spaces.
+  return String(text).replace(/[#$]/g, "").replace(/\s+/g, " ").trim();
+}
+
 function readOcrFieldValue(value) {
   if (value === null || value === undefined) return "—";
-  if (typeof value === "string") return value;
-  if (typeof value === "object" && value.text) return value.text;
+  if (typeof value === "string") return cleanOcrText(value) || "—";
+  if (typeof value === "object" && value.text) return cleanOcrText(value.text) || "—";
   return "—";
+}
+
+// The truck company is always one of these two real carriers. OCR often reads it
+// wrong (e.g. "MAYA Organized Inc"), so snap whatever was read to the closest one.
+const KNOWN_TRUCK_COMPANIES = ["OCEANLAND INC", "OCEANHUB INC"];
+
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    for (let j = 1; j <= n; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}
+
+function normalizeTruckCompany(value) {
+  if (value === null || value === undefined || value === "—") return value;
+  const text = String(value).trim();
+  if (!text) return "—";
+  const lower = text.toLowerCase();
+  // Distinguishing tokens win immediately.
+  if (lower.includes("hub")) return "OCEANHUB INC";
+  if (lower.includes("land") || lower.includes("ocean")) return "OCEANLAND INC";
+  // Otherwise pick the closest canonical name by edit distance (ties -> first).
+  let best = KNOWN_TRUCK_COMPANIES[0];
+  let bestDist = Infinity;
+  for (const cand of KNOWN_TRUCK_COMPANIES) {
+    const d = levenshtein(lower, cand.toLowerCase());
+    if (d < bestDist) {
+      bestDist = d;
+      best = cand;
+    }
+  }
+  return best;
 }
 
 function readOcrFieldConfidence(value) {
   if (value !== null && typeof value === "object" && value.confidence != null) return value.confidence;
+  return null;
+}
+
+function readOcrFieldCamera(value) {
+  if (value !== null && typeof value === "object" && value.camera) return value.camera;
   return null;
 }
 
@@ -81,11 +132,16 @@ function readTruckFields(truck) {
   ];
   const fieldTexts = {};
   const fieldConfs = {};
+  const fieldCameras = {};
   for (const f of ocrFields) {
     fieldTexts[f] = readOcrFieldValue(info[f]);
     const c = readOcrFieldConfidence(info[f]);
     fieldConfs[f] = c != null ? c.toFixed(3) : "—";
+    const cam = readOcrFieldCamera(info[f]);
+    if (cam) fieldCameras[f] = cam;
   }
+  // Constrain truck company to a known carrier name.
+  fieldTexts.truck_company = normalizeTruckCompany(fieldTexts.truck_company);
   // Show max OCR confidence across filled fields — reflects the best crop selected per class
   const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
   const maxOcrConf = ocrConfs.length > 0 ? Math.max(...ocrConfs).toFixed(3) : "—";
@@ -93,6 +149,8 @@ function readTruckFields(truck) {
   return {
     trackId: pickFirst(truck?.track_id),
     truckClass: pickFirst(truck?.truck_type, truck?.type),
+    camera: pickFirst(truck?.camera, truck?.associated_info?._fusion?.source_cameras?.[0]),
+    fieldCameras,
     ...fieldTexts,
     ...Object.fromEntries(Object.entries(fieldConfs).map(([k, v]) => [k + "_conf", v])),
     driver: fieldTexts.driver,
@@ -131,6 +189,8 @@ function stripOcrMarkdown(value) {
   let cleaned = value.replace(/!\[.*?\]\(.*?\)\s*/g, "");
   // Remove HTML tags
   cleaned = cleaned.replace(/<[^>]+>/g, " ");
+  // Remove decorative '#' and '$' signs (OCR/markdown artifacts)
+  cleaned = cleaned.replace(/[#$]/g, "");
   // Collapse whitespace and trim
   cleaned = cleaned.replace(/\s+/g, " ").trim();
   // If nothing intelligible remains, return a short fallback
@@ -152,6 +212,7 @@ function normalizeTruckFromSnapshot(trackId, truck) {
     id: `track-${safeTrackId}`,
     track_id: safeTrackId,
     truck_type: truck?.type || "—",
+    camera: truck?.camera || "",
     first_seen_frame: truck?.first ?? truck?.first_seen_frame ?? null,
     last_seen_frame: truck?.last ?? truck?.last_seen_frame ?? null,
     first_seen_time_sec: truck?.first_seen_time_sec ?? null,
@@ -195,6 +256,7 @@ export default function App() {
   const [groupByField, setGroupByField] = useState(false);
   const [multiCamMode, setMultiCamMode] = useState(false);
   const [camFiles, setCamFiles] = useState({ front: null, right: null, back: null, left: null });
+  const [camStreamUrls, setCamStreamUrls] = useState({ front: null, right: null, back: null, left: null });
   const [videoZoom, setVideoZoom] = useState(1);
   const videoRef = useRef(null);
   const streamFrameLoadingRef = useRef(false);
@@ -412,19 +474,16 @@ export default function App() {
       retries = 0;
       const progress = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
       setMessage(`Multi-camera ${jobId.slice(0, 8)} | ${status.state} | ${progress}`);
-      const streamCamera = (status.cameras || []).find((camera) => {
-        const latestFrame = camera.latest_frame_id ?? camera.frame_id ?? 0;
-        return latestFrame > 0;
-      });
-      if (streamCamera && !streamFrameLoadingRef.current) {
-        const latestFrame = streamCamera.latest_frame_id ?? streamCamera.frame_id ?? 0;
-        const frameKey = `${streamCamera.camera}:${latestFrame}`;
-        if (frameKey !== lastRequestedFrameRef.current) {
-          streamFrameLoadingRef.current = true;
-          lastRequestedFrameRef.current = frameKey;
-          setStreamFrameUrl(
-            `${getMultiCameraFrameUrl(jobId, streamCamera.camera)}?frame=${latestFrame}&ts=${Date.now()}`
-          );
+      for (const camStatus of (status.cameras || [])) {
+        const latestFrame = camStatus.latest_frame_id ?? camStatus.frame_id ?? 0;
+        if (latestFrame > 0) {
+          const frameKey = `${camStatus.camera}:${latestFrame}`;
+          if (frameKey !== lastRequestedFrameRef.current) {
+            lastRequestedFrameRef.current = frameKey;
+            const url = `${getMultiCameraFrameUrl(jobId, camStatus.camera)}?frame=${latestFrame}&ts=${Date.now()}`;
+            setCamStreamUrls((prev) => ({ ...prev, [camStatus.camera]: url }));
+            setStreamFrameUrl(url);
+          }
         }
       }
       if (status.ocr_log && status.ocr_log.length > 0) {
@@ -447,7 +506,7 @@ export default function App() {
   }
 
   async function handleVideoUpload() {
-    const useMultiCamera = selectedCameraCount >= 2;
+    const useMultiCamera = selectedCameraCount >= 1;
     setLoading(true);
     setMessage("");
     setProcessStatus("uploading");
@@ -457,6 +516,7 @@ export default function App() {
       setReviewIndex(0);
       setActiveJobId("");
       setStreamFrameUrl("");
+      setCamStreamUrls({ front: null, right: null, back: null, left: null });
       streamFrameLoadingRef.current = false;
       lastRequestedFrameRef.current = "";
       setStreamWarning("");
@@ -469,8 +529,8 @@ export default function App() {
         const selected = Object.fromEntries(
           Object.entries(camFiles).filter(([, f]) => f != null)
         );
-        if (Object.keys(selected).length < 2) {
-          throw new Error("Select at least 2 camera angles.");
+        if (Object.keys(selected).length < 1) {
+          throw new Error("Select at least one camera angle.");
         }
         setMessage("Starting multi-camera jobs...");
         const start = await startMultiCameraTruckRun(selected);
@@ -638,28 +698,42 @@ export default function App() {
             <div className="form-pane">
               <div className="form-block">
                 <h3>TRUCKER INFORMATION</h3>
-                <p>POPULATED FROM MODEL CLASS FIELDS</p>
+                <p>POPULATED FROM MODEL CLASS FIELDS
+                  {currentFields.camera ? <span className="cam-source-chip" style={{marginLeft: 8}}>{currentFields.camera.toUpperCase()}</span> : null}
+                </p>
                 <div className="field-row">
                   <div className="field-wrap">
-                    <span className="field-name">truck_company</span>
-                    <input value={currentFields.truck_company} placeholder="truck_company" readOnly />
+                    <span className="field-name">
+                      truck_company
+                      {currentFields.fieldCameras?.truck_company && <span className={`field-cam-tag cam-${currentFields.fieldCameras.truck_company}`}>{currentFields.fieldCameras.truck_company.toUpperCase()}</span>}
+                    </span>
+                    <input value={currentFields.truck_company} placeholder="truck_company" readOnly className={currentFields.fieldCameras?.truck_company ? `cam-border-${currentFields.fieldCameras.truck_company}` : ""} />
                   </div>
                   <button type="button" disabled>
                     DETECTED
                   </button>
                   <div className="field-wrap">
-                    <span className="field-name">driver</span>
-                    <input value={currentFields.driver} placeholder="driver" readOnly />
+                    <span className="field-name">
+                      driver
+                      {currentFields.fieldCameras?.driver && <span className={`field-cam-tag cam-${currentFields.fieldCameras.driver}`}>{currentFields.fieldCameras.driver.toUpperCase()}</span>}
+                    </span>
+                    <input value={currentFields.driver} placeholder="driver" readOnly className={currentFields.fieldCameras?.driver ? `cam-border-${currentFields.fieldCameras.driver}` : ""} />
                   </div>
                 </div>
                 <div className="field-row two with-gap">
                   <div className="field-wrap">
-                    <span className="field-name">license_plate</span>
-                    <input value={currentFields.license_plate} placeholder="license_plate" readOnly />
+                    <span className="field-name">
+                      license_plate
+                      {currentFields.fieldCameras?.license_plate && <span className={`field-cam-tag cam-${currentFields.fieldCameras.license_plate}`}>{currentFields.fieldCameras.license_plate.toUpperCase()}</span>}
+                    </span>
+                    <input value={currentFields.license_plate} placeholder="license_plate" readOnly className={currentFields.fieldCameras?.license_plate ? `cam-border-${currentFields.fieldCameras.license_plate}` : ""} />
                   </div>
                   <div className="field-wrap">
-                    <span className="field-name">truck_number</span>
-                    <input value={currentFields.truck_number} placeholder="truck_number" readOnly />
+                    <span className="field-name">
+                      truck_number
+                      {currentFields.fieldCameras?.truck_number && <span className={`field-cam-tag cam-${currentFields.fieldCameras.truck_number}`}>{currentFields.fieldCameras.truck_number.toUpperCase()}</span>}
+                    </span>
+                    <input value={currentFields.truck_number} placeholder="truck_number" readOnly className={currentFields.fieldCameras?.truck_number ? `cam-border-${currentFields.fieldCameras.truck_number}` : ""} />
                   </div>
                 </div>
               </div>
@@ -670,22 +744,34 @@ export default function App() {
                 <div className="field-row two">
                   <div className="pair">
                     <div className="field-wrap">
-                      <span className="field-name">container_number</span>
-                      <input value={currentFields.container_number} placeholder="container_number" readOnly />
+                      <span className="field-name">
+                        container_number
+                        {currentFields.fieldCameras?.container_number && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_number}`}>{currentFields.fieldCameras.container_number.toUpperCase()}</span>}
+                      </span>
+                      <input value={currentFields.container_number} placeholder="container_number" readOnly className={currentFields.fieldCameras?.container_number ? `cam-border-${currentFields.fieldCameras.container_number}` : ""} />
                     </div>
                     <div className="field-wrap">
-                      <span className="field-name">container_side_no</span>
-                      <input value={currentFields.container_side_no} placeholder="container_side_no" readOnly />
+                      <span className="field-name">
+                        container_side_no
+                        {currentFields.fieldCameras?.container_side_no && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_side_no}`}>{currentFields.fieldCameras.container_side_no.toUpperCase()}</span>}
+                      </span>
+                      <input value={currentFields.container_side_no} placeholder="container_side_no" readOnly className={currentFields.fieldCameras?.container_side_no ? `cam-border-${currentFields.fieldCameras.container_side_no}` : ""} />
                     </div>
                   </div>
                   <div className="pair">
                     <div className="field-wrap">
-                      <span className="field-name">container_company_logo</span>
-                      <input value={currentFields.container_company_logo} placeholder="container_company_logo" readOnly />
+                      <span className="field-name">
+                        container_company_logo
+                        {currentFields.fieldCameras?.container_company_logo && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_company_logo}`}>{currentFields.fieldCameras.container_company_logo.toUpperCase()}</span>}
+                      </span>
+                      <input value={currentFields.container_company_logo} placeholder="container_company_logo" readOnly className={currentFields.fieldCameras?.container_company_logo ? `cam-border-${currentFields.fieldCameras.container_company_logo}` : ""} />
                     </div>
                     <div className="field-wrap">
-                      <span className="field-name">other_container_info</span>
-                      <input value={currentFields.other_container_info} placeholder="other_container_info" readOnly />
+                      <span className="field-name">
+                        other_container_info
+                        {currentFields.fieldCameras?.other_container_info && <span className={`field-cam-tag cam-${currentFields.fieldCameras.other_container_info}`}>{currentFields.fieldCameras.other_container_info.toUpperCase()}</span>}
+                      </span>
+                      <input value={currentFields.other_container_info} placeholder="other_container_info" readOnly className={currentFields.fieldCameras?.other_container_info ? `cam-border-${currentFields.fieldCameras.other_container_info}` : ""} />
                     </div>
                   </div>
                 </div>
@@ -740,7 +826,29 @@ export default function App() {
                 <span>DEMO STREAM</span>
               </div>
               <div className="stream-view">
-                {activeJobId && streamFrameUrl ? (
+                {selectedCameraCount >= 1 && Object.values(camStreamUrls).some(Boolean) ? (
+                  <div className="multi-cam-grid">
+                    {["front", "right", "back", "left"].map((cam) =>
+                      camFiles[cam] ? (
+                        <div key={cam} className="multi-cam-cell">
+                          <span className="cam-label-badge">{cam.toUpperCase()}</span>
+                          {camStreamUrls[cam] ? (
+                            <img
+                              src={camStreamUrls[cam]}
+                              alt={`${cam} stream`}
+                              className="stream-image"
+                              style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
+                              onError={() => { streamFrameLoadingRef.current = false; }}
+                              onLoad={() => { streamFrameLoadingRef.current = false; }}
+                            />
+                          ) : (
+                            <div className="stream-empty cam-waiting">Waiting for {cam}…</div>
+                          )}
+                        </div>
+                      ) : null
+                    )}
+                  </div>
+                ) : activeJobId && streamFrameUrl ? (
                   <img
                     src={streamFrameUrl}
                     alt="Live detection stream"
@@ -822,7 +930,7 @@ export default function App() {
                 ))}
               </div>
               <div className="multi-upload-note">
-                Select at least two camera videos. The dashboard will use multi-camera mode automatically.
+                Upload 1–4 camera angles (front / right / back / left) of the same vehicle. All streams run in parallel — OCR fires immediately on each detection.
               </div>
               {ocrLog.length > 0 && (
                 <div className="ocr-log-panel">
@@ -889,6 +997,7 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>Status</th>
+                      <th>Camera</th>
                       <th>Truck ID</th>
                       {groupByField && <th>Source Tracks</th>}
                       <th>Truck Class</th>
@@ -928,6 +1037,11 @@ export default function App() {
                           <td>
                             <span className={`status-chip status-${status}`}>{status}</span>
                           </td>
+                          <td>
+                            {fields.camera
+                              ? <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>
+                              : <span className="cam-source-chip cam-source-unknown">—</span>}
+                          </td>
                           <td>{fields.trackId}</td>
                           {groupByField && (
                             <td>
@@ -935,14 +1049,14 @@ export default function App() {
                             </td>
                           )}
                           <td><span className="cell-truncate" title={fields.truckClass}>{shortText(fields.truckClass, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_number}>{shortText(fields.container_number, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_side_no}>{shortText(fields.container_side_no, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.driver}>{shortText(fields.driver, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.license_plate}>{shortText(fields.license_plate, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.other_container_info}>{shortText(fields.other_container_info, 26)}</span></td>
-                          <td><span className="cell-truncate" title={fields.truck_company}>{shortText(fields.truck_company, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.truck_number}>{shortText(fields.truck_number, 24)}</span></td>
+                          <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 20)}{fields.fieldCameras?.container_company_logo && <span className={`field-cam-tag cam-${fields.fieldCameras.container_company_logo}`}>{fields.fieldCameras.container_company_logo[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.container_number}>{shortText(fields.container_number, 20)}{fields.fieldCameras?.container_number && <span className={`field-cam-tag cam-${fields.fieldCameras.container_number}`}>{fields.fieldCameras.container_number[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.container_side_no}>{shortText(fields.container_side_no, 20)}{fields.fieldCameras?.container_side_no && <span className={`field-cam-tag cam-${fields.fieldCameras.container_side_no}`}>{fields.fieldCameras.container_side_no[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.driver}>{shortText(fields.driver, 20)}{fields.fieldCameras?.driver && <span className={`field-cam-tag cam-${fields.fieldCameras.driver}`}>{fields.fieldCameras.driver[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.license_plate}>{shortText(fields.license_plate, 20)}{fields.fieldCameras?.license_plate && <span className={`field-cam-tag cam-${fields.fieldCameras.license_plate}`}>{fields.fieldCameras.license_plate[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.other_container_info}>{shortText(fields.other_container_info, 20)}{fields.fieldCameras?.other_container_info && <span className={`field-cam-tag cam-${fields.fieldCameras.other_container_info}`}>{fields.fieldCameras.other_container_info[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.truck_company}>{shortText(fields.truck_company, 20)}{fields.fieldCameras?.truck_company && <span className={`field-cam-tag cam-${fields.fieldCameras.truck_company}`}>{fields.fieldCameras.truck_company[0].toUpperCase()}</span>}</span></td>
+                          <td><span className="cell-truncate" title={fields.truck_number}>{shortText(fields.truck_number, 20)}{fields.fieldCameras?.truck_number && <span className={`field-cam-tag cam-${fields.fieldCameras.truck_number}`}>{fields.fieldCameras.truck_number[0].toUpperCase()}</span>}</span></td>
                           <td>{fields.ocr_confidence}</td>
                           <td>{fields.confidence}</td>
                           <td>{fields.durationSec}</td>
@@ -1006,15 +1120,20 @@ export default function App() {
                             {hasTrailer ? "WITH TRAILER" : "NO TRAILER"}
                           </span>
                           <span className="gate-time">{timeRange}</span>
+                          {fields.camera && <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>}
                           <span className={`status-chip status-${status}`}>{status}</span>
                         </div>
-                        {cameras.length > 0 && (
+                        {(cameras.length > 0 || fields.camera) && (
                           <div className="gate-cameras">
-                            <span className="gate-cameras-label">Cameras</span>
-                            {cameras.map((cam) => (
-                              <span key={cam} className="gate-cam-badge">{cam} <span className="gate-cam-track">T#{cameraMap[cam]}</span></span>
-                            ))}
-                            {truck._groupCount > 1 && cameras.length === 0 && (
+                            <span className="gate-cameras-label">Source</span>
+                            {cameras.length > 0
+                              ? cameras.map((cam) => (
+                                  <span key={cam} className="gate-cam-badge">{cam.toUpperCase()} <span className="gate-cam-track">T#{cameraMap[cam]}</span></span>
+                                ))
+                              : fields.camera
+                                ? <span className="gate-cam-badge">{fields.camera.toUpperCase()} <span className="gate-cam-track">T#{truck.track_id}</span></span>
+                                : null}
+                            {truck._groupCount > 1 && cameras.length === 0 && !fields.camera && (
                               <span className="gate-cam-badge">{truck._sourceTracks}</span>
                             )}
                           </div>
@@ -1078,9 +1197,11 @@ export default function App() {
                     <article key={truck.id} className={`truck-card ${status === "rejected" ? "truck-card-rejected" : ""}`}>
                       <div className="truck-card-head">
                         <strong>Truck #{fields.trackId}</strong>
+                        {fields.camera && <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>}
                         <span className={`status-chip status-${status}`}>{status}</span>
                       </div>
                       <div className="truck-card-grid">
+                        <p><b>source_camera:</b> {fields.camera || "—"}</p>
                         <p><b>truck_class:</b> {fields.truckClass}</p>
                         <p><b>truck_company:</b> {fields.truck_company}</p>
                         <p><b>driver:</b> {fields.driver}</p>

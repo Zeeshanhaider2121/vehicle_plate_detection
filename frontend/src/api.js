@@ -1,6 +1,9 @@
 import axios from "axios";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+// Default to a same-origin (relative) base so the app works on whatever
+// host/port served it (e.g. the backend on :8001). Override with
+// VITE_API_BASE_URL only when the API lives on a different origin.
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 export const api = axios.create({
   baseURL: API_BASE_URL,

@@ -1316,8 +1316,8 @@ async def start_multi_camera_job(
 ) -> MultiCameraAnalyzeStartResponse:
     uploads = {"front": front, "right": right, "back": back, "left": left}
     selected = {camera: upload for camera, upload in uploads.items() if upload is not None}
-    if len(selected) < 2:
-        raise HTTPException(status_code=400, detail="Upload at least two camera videos.")
+    if len(selected) < 1:
+        raise HTTPException(status_code=400, detail="Upload at least one camera video.")
 
     constraints = await _read_optional_json_upload(demo_constraints, "demo constraints")
     aggregate_job_id = uuid4().hex
@@ -1330,7 +1330,7 @@ async def start_multi_camera_job(
             raise HTTPException(status_code=400, detail=f"{camera} video is empty.")
         filename = f"{camera}_{upload.filename or 'upload.mp4'}"
         try:
-            data = video_service.start_video_job(raw, filename)
+            data = video_service.start_video_job(raw, filename, camera_label=camera)
         except Exception as exc:  # pragma: no cover
             raise HTTPException(status_code=502, detail=f"Failed to start {camera} camera job: {exc}") from exc
         child_job_id = data.get("job_id")

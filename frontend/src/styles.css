@@ -252,8 +252,9 @@ html, body {
 .content-grid {
   margin-top: 18px;
   display: grid;
-  grid-template-columns: 1.9fr 1fr;
+  grid-template-columns: minmax(0, 1.9fr) minmax(0, 1fr);
   gap: 18px;
+  align-items: start;
 }
 
 .form-pane {
@@ -261,6 +262,8 @@ html, body {
   background: #ffffff;
   border-radius: 16px;
   padding: 22px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .form-block + .form-block {
@@ -357,6 +360,9 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-width: 0;
+  overflow: hidden;
+  width: 100%;
 }
 
 .stream-head {
@@ -762,6 +768,8 @@ th {
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.6);
   overflow: hidden;
+  width: 100%;
+  min-width: 0;
 }
 
 .ocr-log-head {
@@ -777,6 +785,7 @@ th {
 .ocr-log-scroll {
   max-height: 120px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 4px 0;
 }
 
@@ -949,6 +958,100 @@ th {
   font-weight: 700;
   line-height: 1.35;
 }
+
+.multi-cam-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 3px;
+  width: 100%;
+  height: 100%;
+  background: #0a0f1a;
+}
+
+.multi-cam-cell {
+  position: relative;
+  overflow: hidden;
+  background: #0d1525;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 90px;
+}
+
+.multi-cam-cell .stream-image {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.cam-label-badge {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  background: rgba(10, 20, 50, 0.82);
+  color: #7eb8ff;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  z-index: 2;
+  pointer-events: none;
+  border: 1px solid rgba(100, 160, 255, 0.3);
+}
+
+.cam-waiting {
+  font-size: 11px;
+  color: var(--text2);
+  padding: 12px;
+  text-align: center;
+}
+
+.cam-source-chip {
+  display: inline-block;
+  background: #0d2a50;
+  color: #5ba8ff;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(91, 168, 255, 0.35);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.cam-source-unknown {
+  background: transparent;
+  color: var(--text2);
+  border-color: transparent;
+}
+
+/* ── Per-field camera badge (tiny, inline with field name) ────────────────── */
+.field-cam-tag {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 900;
+  letter-spacing: 0.07em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  vertical-align: middle;
+  margin-left: 5px;
+  text-transform: uppercase;
+}
+
+/* Four camera colours */
+.cam-front  { background: #0d2a50; color: #5ba8ff; border: 1px solid rgba(91,168,255,0.4); }
+.cam-right  { background: #0d3020; color: #52d68a; border: 1px solid rgba(82,214,138,0.4); }
+.cam-back   { background: #321200; color: #ff9b3a; border: 1px solid rgba(255,155,58,0.4); }
+.cam-left   { background: #220d38; color: #c77dff; border: 1px solid rgba(199,125,255,0.4); }
+
+/* Input left-border tint when a camera source is known */
+.cam-border-front { border-left: 3px solid #5ba8ff !important; }
+.cam-border-right { border-left: 3px solid #52d68a !important; }
+.cam-border-back  { border-left: 3px solid #ff9b3a !important; }
+.cam-border-left  { border-left: 3px solid #c77dff !important; }
 
 .stream-controls {
   display: flex;

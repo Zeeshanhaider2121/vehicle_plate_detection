@@ -20,13 +20,28 @@ dependencies = [
     "opencv-python-headless>=4.10.0",
     "pillow>=10.0.0",
     "numpy>=1.26.0",
-    "torch>=2.0.0",
-    "torchvision>=0.15.0",
+    "torch>=2.4.0",           # Updated minimum
+    "torchvision>=0.19.0",    # Updated minimum
     "ultralytics>=8.0.0",
 ]
 
-[tool.uv]
-python-preference = "system"
+# ====================== PYTORCH CUDA CONFIG ======================
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" }
+]
+torchvision = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" }
+]
+torchaudio = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" }
+]
 
 [build-system]
 requires = ["hatchling"]
