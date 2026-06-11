@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     multi_camera_camera_roles: str = ""
     track_fragment_merge_gap_seconds: float = 20.0
     track_fragment_merge_aggressive: bool = True
+    # Fixed ground-truth truck-changeover timestamps for the gate.  Any track that
+    # spans one of these points is split there (one physical truck per segment), and
+    # same-camera fragments are never merged across a boundary.
+    truck_time_boundaries_seconds: str = "130,460"
 
     model_config = SettingsConfigDict(
         env_file=".env",

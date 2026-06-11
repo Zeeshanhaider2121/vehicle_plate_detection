@@ -1,4 +1,6 @@
+import copy
 import json
+import logging
 import re
 from pathlib import Path
 from datetime import UTC, datetime
@@ -47,6 +49,29 @@ FRONTEND_DIST_DIR = Path(__file__).resolve().parents[2] / "frontend" / "dist"
 
 _multi_camera_jobs: dict[str, dict[str, Any]] = {}
 _video_demo_constraints: dict[str, dict[str, Any]] = {}
+
+# ── Merge logger: writes to stdout AND a rolling log file ──────────────────
+_MC_LOG_DIR = Path(__file__).resolve().parents[1] / "plateflow_outputs"
+_MC_LOG_PATH = _MC_LOG_DIR / "multi_camera_merge.log"
+_mc_logger = logging.getLogger("plateflow.mc_merge")
+if not _mc_logger.handlers:
+    _mc_logger.setLevel(logging.DEBUG)
+    _mc_logger.propagate = False
+    _fmt = logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    _mc_logger.addHandler(_sh)
+    try:
+        _MC_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _fh = logging.FileHandler(str(_MC_LOG_PATH), mode="a", encoding="utf-8")
+        _fh.setFormatter(_fmt)
+        _mc_logger.addHandler(_fh)
+    except OSError:
+        pass
+
+
+def _mc_log(msg: str) -> None:
+    _mc_logger.info(msg)
 
 CAMERA_LABELS = tuple(
     item.strip()
@@ -100,6 +125,12 @@ MULTI_CAMERA_CAMERA_ROLES: dict[str, set[str]] = _parse_camera_roles(settings.mu
 
 CAMERA_TIME_OFFSETS_SECONDS = _parse_camera_time_offsets(
     settings.multi_camera_time_offsets_seconds
+)
+
+TRUCK_TIME_BOUNDARIES: list[float] = sorted(
+    float(s.strip())
+    for s in settings.truck_time_boundaries_seconds.split(",")
+    if s.strip()
 )
 
 app.add_middleware(
@@ -356,6 +387,162 @@ def _normalize_truck_payload(track_key: str, truck: dict[str, Any]) -> dict[str,
     }
 
 
+# Minimum fraction of the SHORTER observation that must overlap for two
+# observations to be considered the same physical truck.  A pure range-touch
+# (e.g., truck-1 ends at 140 s while truck-2 starts at 138 s) produces only
+# 2 s of overlap against a 140 s track → 1.4 % → correctly rejected.
+_MIN_OVERLAP_RATIO = 0.25   # 25 % of the shorter duration must overlap
+_MIN_OVERLAP_SEC   = 0.5    # AND at least 0.5 s (just noise guard — ratio is the real filter)
+
+
+def _temporal_overlap_info(obs_a: dict[str, Any], obs_b: dict[str, Any]) -> tuple[float, float]:
+    """Return (overlap_seconds, overlap_ratio) between two observations.
+
+    overlap_ratio = overlap_seconds / duration_of_shorter_observation.
+    Returns (0.0, 0.0) when there is no overlap or data is missing.
+    """
+    t_a, t_b = obs_a["truck"], obs_b["truck"]
+    a_s, a_e = t_a.get("first_seen_time_sec"), t_a.get("last_seen_time_sec")
+    b_s, b_e = t_b.get("first_seen_time_sec"), t_b.get("last_seen_time_sec")
+    if None in (a_s, a_e, b_s, b_e):
+        return 0.0, 0.0
+    try:
+        a_s, a_e, b_s, b_e = float(a_s), float(a_e), float(b_s), float(b_e)
+    except (TypeError, ValueError):
+        return 0.0, 0.0
+    overlap = min(a_e, b_e) - max(a_s, b_s)
+    if overlap <= 0:
+        return 0.0, 0.0
+    dur_a = max(a_e - a_s, 0.001)
+    dur_b = max(b_e - b_s, 0.001)
+    shorter = min(dur_a, dur_b)
+    return overlap, overlap / shorter
+
+
+def _observations_overlap_temporally(obs_a: dict[str, Any], obs_b: dict[str, Any]) -> bool:
+    """Return True only when the overlap is substantial (≥25 % of shorter track AND ≥3 s).
+
+    This prevents sequential trucks whose detection windows barely touch at the
+    boundary from being merged together.
+    """
+    overlap_s, ratio = _temporal_overlap_info(obs_a, obs_b)
+    return overlap_s >= _MIN_OVERLAP_SEC and ratio >= _MIN_OVERLAP_RATIO
+
+
+def _group_observations_by_time(observations: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group all cross-camera observations by substantial temporal overlap.
+
+    Rules:
+    - Two observations from the SAME camera are NEVER merged (they are distinct trucks).
+    - Two observations from DIFFERENT cameras merge only when their time windows
+      overlap by at least _MIN_OVERLAP_RATIO of the shorter duration AND ≥_MIN_OVERLAP_SEC.
+    """
+    sorted_obs = sorted(
+        observations,
+        key=lambda o: (float(o["truck"].get("first_seen_time_sec") or 0), o["camera"]),
+    )
+    groups: list[list[dict[str, Any]]] = []
+
+    _mc_log(f"[GROUP-BY-TIME] Grouping {len(sorted_obs)} observations "
+            f"(min_overlap={_MIN_OVERLAP_SEC}s, min_ratio={_MIN_OVERLAP_RATIO:.0%})")
+
+    for obs in sorted_obs:
+        cam  = obs["camera"]
+        t    = obs["truck"]
+        t_s  = t.get("first_seen_time_sec", "?")
+        t_e  = t.get("last_seen_time_sec",  "?")
+        tid  = t.get("track_id", "?")
+        _mc_log(f"  obs  {cam}/T#{tid}  window=[{t_s}s – {t_e}s]")
+
+        placed = False
+        for gi, group in enumerate(groups):
+            if any(g["camera"] == cam for g in group):
+                continue  # same camera already in this group
+            for member in group:
+                overlap_s, ratio = _temporal_overlap_info(member, obs)
+                if overlap_s >= _MIN_OVERLAP_SEC and ratio >= _MIN_OVERLAP_RATIO:
+                    m_cam = member["camera"]
+                    m_tid = member["truck"].get("track_id", "?")
+                    _mc_log(f"       -> JOIN group {gi + 1}  "
+                            f"(matched {m_cam}/T#{m_tid}: "
+                            f"overlap={overlap_s:.1f}s, ratio={ratio:.0%})")
+                    group.append(obs)
+                    placed = True
+                    break
+            if placed:
+                break
+
+        if not placed:
+            groups.append([obs])
+            _mc_log(f"       -> NEW group {len(groups)}")
+
+    _mc_log(f"[GROUP-BY-TIME] Result: {len(groups)} group(s)")
+    for gi, group in enumerate(groups):
+        labels = ", ".join(f"{g['camera']}/T#{g['truck'].get('track_id','?')}" for g in group)
+        _mc_log(f"  group {gi + 1}: [{labels}]")
+
+    return groups
+
+
+def _truck_window_index(obs: dict[str, Any], boundaries: list[float]) -> int:
+    """Return which truck-window an observation belongs to.
+
+    Windows are the intervals between consecutive boundaries: with boundaries
+    [130, 460] there are three windows — (-inf,130]=0, (130,460]=1, (460,inf)=2.
+    Assignment is by the observation's midpoint, so a piece produced by
+    _split_observation_at_boundaries (which never crosses a boundary) lands cleanly
+    in one window.
+    """
+    t = obs["truck"]
+    s = t.get("first_seen_time_sec")
+    e = t.get("last_seen_time_sec")
+    try:
+        mid = (float(s) + float(e)) / 2.0
+    except (TypeError, ValueError):
+        try:
+            mid = float(s)
+        except (TypeError, ValueError):
+            return 0
+    idx = 0
+    for b in boundaries:
+        if mid >= b:
+            idx += 1
+        else:
+            break
+    return idx
+
+
+def _group_observations_by_window(
+    observations: list[dict[str, Any]], boundaries: list[float]
+) -> list[list[dict[str, Any]]]:
+    """Group observations by fixed truck-window (one physical truck per window).
+
+    Used when ground-truth changeover boundaries are configured.  Every observation
+    that falls in the same window is the same physical truck — regardless of camera,
+    overlap, or how many tracks a single camera produced.  This is robust to the two
+    failure modes of pure overlap-chaining: (1) a rear-camera view that only briefly
+    overlaps a front-camera view of the same truck, and (2) one camera producing two
+    short re-tracks of the same truck within a window.
+    """
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    _mc_log(f"[GROUP-BY-WINDOW] Grouping {len(observations)} observations "
+            f"into truck-windows at boundaries={boundaries}")
+    for obs in sorted(observations,
+                      key=lambda o: (float(o["truck"].get("first_seen_time_sec") or 0), o["camera"])):
+        idx = _truck_window_index(obs, boundaries)
+        buckets.setdefault(idx, []).append(obs)
+        t = obs["truck"]
+        _mc_log(f"  {obs['camera']}/T#{t.get('track_id','?')} "
+                f"[{t.get('first_seen_time_sec')}s – {t.get('last_seen_time_sec')}s] "
+                f"-> window {idx}")
+    groups = [buckets[k] for k in sorted(buckets.keys())]
+    _mc_log(f"[GROUP-BY-WINDOW] Result: {len(groups)} group(s)")
+    for gi, group in enumerate(groups):
+        labels = ", ".join(f"{g['camera']}/T#{g['truck'].get('track_id','?')}" for g in group)
+        _mc_log(f"  window-group {gi + 1}: [{labels}]")
+    return groups
+
+
 def _apply_camera_time_offset(truck: dict[str, Any], camera: str) -> dict[str, Any]:
     offset = CAMERA_TIME_OFFSETS_SECONDS.get(camera, 0.0)
     if not offset:
@@ -508,6 +695,20 @@ def _merge_truck_group(
 
     merged_info["_camera_observations"] = camera_observations
     merged_info["_field_validation"] = field_validation
+    source_track_ids = {
+        obs["camera"]: obs["truck"].get("track_id")
+        for obs in observations
+    }
+    contributing_cameras = sorted({obs["camera"] for obs in observations})
+    camera_label = "+".join(c.capitalize() for c in contributing_cameras)
+
+    # Human-readable per-camera track labels, e.g. ["Front/T1", "Right/T2"]
+    source_track_labels = [
+        f"{cam.capitalize()}/T#{source_track_ids[cam]}"
+        for cam in contributing_cameras
+        if source_track_ids.get(cam) is not None
+    ]
+
     merged_info["_fusion"] = {
         "entity_track_id": entity_id,
         "match_method": match_method,
@@ -516,15 +717,14 @@ def _merge_truck_group(
         "review_reason": "; ".join(review_reasons) if review_reasons else None,
         "identity_keys": identity_keys,
         "camera_roles_applied": bool(camera_roles),
-        "camera_count": len({obs["camera"] for obs in observations}),
+        "camera_count": len(contributing_cameras),
+        "source_cameras": contributing_cameras,
+        "source_track_labels": source_track_labels,
         "camera_time_offsets_seconds": {
             obs["camera"]: obs["truck"].get("time_offset_sec", 0.0)
             for obs in observations
         },
-        "source_track_ids": {
-            obs["camera"]: obs["truck"].get("track_id")
-            for obs in observations
-        },
+        "source_track_ids": source_track_ids,
     }
     preferred_type = (
         "truck_with_container"
@@ -532,18 +732,35 @@ def _merge_truck_group(
         else (truck_types[0] or "truck_without_container")
     )
 
+    first_t = min(first_times) if first_times else None
+    last_t  = max(last_times)  if last_times  else None
+
+    _mc_log(
+        f"  [MERGE] Entity #{entity_id}  cameras=[{camera_label}]  "
+        f"window=[{first_t}s – {last_t}s]  method={match_method}  "
+        f"tracks={source_track_labels}  "
+        f"fields={{ "
+        + ", ".join(
+            f"{k}={(_field_text(merged_info.get(k)) or '—')!r}"
+            for k in ("container_number", "license_plate", "truck_number")
+        )
+        + " }}"
+    )
+
     return {
         "track_id": entity_id,
         "type": preferred_type,
+        "camera": camera_label,
+        "cameras": contributing_cameras,
         "first_seen_frame": min(first_frames) if first_frames else None,
         "last_seen_frame": max(last_frames) if last_frames else None,
-        "first_seen_time_sec": min(first_times) if first_times else None,
-        "last_seen_time_sec": max(last_times) if last_times else None,
+        "first_seen_time_sec": first_t,
+        "last_seen_time_sec": last_t,
         "duration_frames": (
             max(last_frames) - min(first_frames) + 1 if first_frames and last_frames else None
         ),
         "duration_sec": (
-            round(max(last_times) - min(first_times), 3) if first_times and last_times else None
+            round(last_t - first_t, 3) if first_t is not None and last_t is not None else None
         ),
         "confidence_avg": round(sum(confidences) / len(confidences), 4) if confidences else None,
         "last_bbox": first.get("truck", {}).get("last_bbox"),
@@ -631,8 +848,37 @@ def _time_gap_seconds(a: dict[str, Any], b: dict[str, Any]) -> float | None:
     return 0.0
 
 
+def _fragments_cross_boundary(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """True if a configured time boundary separates the two fragments.
+
+    Two fragments are on opposite sides of boundary B when one ends at-or-before B
+    and the other starts at-or-after B.  A fragment that straddles B (starts before,
+    ends after) is NOT considered "on one side" — so genuine same-truck re-tracks
+    that merely touch a boundary are still allowed to merge.
+    """
+    if not TRUCK_TIME_BOUNDARIES:
+        return False
+    a_s, a_e = a.get("first_seen_time_sec"), a.get("last_seen_time_sec")
+    b_s, b_e = b.get("first_seen_time_sec"), b.get("last_seen_time_sec")
+    if None in (a_s, a_e, b_s, b_e):
+        return False
+    try:
+        a_s, a_e, b_s, b_e = float(a_s), float(a_e), float(b_s), float(b_e)
+    except (TypeError, ValueError):
+        return False
+    for boundary in TRUCK_TIME_BOUNDARIES:
+        if (a_e <= boundary <= b_s) or (b_e <= boundary <= a_s):
+            return True
+    return False
+
+
 def _fragments_should_merge(group: list[dict[str, Any]], candidate: dict[str, Any]) -> bool:
     if any(item.get("type") != candidate.get("type") for item in group):
+        return False
+    # Never merge fragments that belong to physically different trucks: if a
+    # changeover boundary separates the candidate from any group member, they are
+    # distinct trucks even if a coincidental OCR id matches.
+    if any(_fragments_cross_boundary(item, candidate) for item in group):
         return False
     if any(_identifiers_compatible(item, candidate) for item in group):
         return True
@@ -863,6 +1109,90 @@ def _apply_demo_constraints_to_payload(
     return constrained
 
 
+def _assign_ocr_fields_to_window(
+    piece_info: dict[str, Any], seg_start: float, seg_end: float
+) -> None:
+    """Restrict a split piece's OCR fields to readings seen within its time window.
+
+    Uses the timestamped `_ocr_history` recorded per field.  For each field that has
+    history, the value is set to the best reading whose capture midpoint falls inside
+    [seg_start, seg_end]; if no reading falls in this window the field is cleared
+    (so e.g. a truck-2 plate read on a continuous rear-camera track does not leak onto
+    the truck-1 piece).  Fields without history are left untouched (legacy fallback).
+    """
+    history = piece_info.get("_ocr_history") or {}
+    if not history:
+        return
+    for field in OCR_FIELD_KEYS:
+        field_hist = history.get(field)
+        if not field_hist:
+            continue  # no timing info for this field — keep deep-copied value as-is
+        best = None
+        for entry in field_hist.values():
+            tf = entry.get("time_first_sec")
+            tl = entry.get("time_last_sec", tf)
+            if tf is None:
+                continue
+            mid = (float(tf) + float(tl)) / 2.0
+            if seg_start <= mid <= seg_end:
+                if best is None or entry.get("confidence", 0.0) > best.get("confidence", 0.0):
+                    best = entry
+        if best is not None:
+            piece_info[field] = {
+                "text": best["text"],
+                "confidence": best.get("confidence", 0.0),
+                "camera": best.get("camera", ""),
+            }
+        else:
+            piece_info[field] = None
+
+
+def _split_observation_at_boundaries(
+    obs: dict[str, Any], boundaries: list[float]
+) -> list[dict[str, Any]]:
+    """Split one observation at configured time boundaries.
+
+    If no boundary falls strictly inside the truck's [first_seen, last_seen] window,
+    returns [obs] unchanged.  Otherwise returns N+1 pieces with adjusted time fields.
+    OCR fields are re-assigned to each piece by the VIDEO time they were captured
+    (via `_ocr_history`), so a continuous track that read different identifiers for
+    successive trucks attributes each value to the correct piece.
+    """
+    truck = obs["truck"]
+    t_start = truck.get("first_seen_time_sec")
+    t_end = truck.get("last_seen_time_sec")
+    if t_start is None or t_end is None:
+        return [obs]
+    try:
+        t_start, t_end = float(t_start), float(t_end)
+    except (TypeError, ValueError):
+        return [obs]
+
+    splits = [b for b in boundaries if t_start < b < t_end]
+    if not splits:
+        return [obs]
+
+    edges = [t_start] + splits + [t_end]
+    result: list[dict[str, Any]] = []
+    for i in range(len(edges) - 1):
+        seg_start = edges[i]
+        seg_end = edges[i + 1]
+        piece = copy.deepcopy(obs)
+        piece["truck"]["first_seen_time_sec"] = seg_start
+        piece["truck"]["last_seen_time_sec"] = seg_end
+        piece["truck"]["duration_sec"] = round(seg_end - seg_start, 3)
+        piece_info = piece["truck"].get("associated_info")
+        if isinstance(piece_info, dict):
+            _assign_ocr_fields_to_window(piece_info, seg_start, seg_end)
+        result.append(piece)
+
+    _mc_log(
+        f"  [SPLIT] {obs['camera']}/T#{truck.get('track_id', '?')} "
+        f"[{t_start}s–{t_end}s] → {len(result)} pieces at boundaries={splits}"
+    )
+    return result
+
+
 def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
     observations: list[dict[str, Any]] = []
     total_frames = 0
@@ -885,17 +1215,22 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             models.add(str(session["model"]))
 
         trucks = payload.get("trucks") or {}
-        for track_key, truck in trucks.items():
-            if isinstance(truck, dict):
-                observations.append(
-                    {
-                        "camera": camera,
-                        "truck": _apply_camera_time_offset(
-                            _normalize_truck_payload(str(track_key), truck),
-                            camera,
-                        ),
-                    }
-                )
+        if trucks:
+            # Merge re-tracked fragments within this camera before grouping
+            # (e.g. left/T#3 [451–493s] + left/T#4 [496–509s] → single truck 3)
+            for merged_truck in _merge_track_fragments(trucks):
+                obs: dict[str, Any] = {
+                    "camera": camera,
+                    "truck": _apply_camera_time_offset(merged_truck, camera),
+                }
+                # Split long observations at configured boundaries
+                # (e.g. back/T#1 [121–456s] splits at 130s → truck-1 piece + truck-2 piece)
+                if TRUCK_TIME_BOUNDARIES:
+                    observations.extend(
+                        _split_observation_at_boundaries(obs, TRUCK_TIME_BOUNDARIES)
+                    )
+                else:
+                    observations.append(obs)
 
     if not observations:
         return {
@@ -921,6 +1256,18 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     for obs in observations:
         observations_by_camera.setdefault(obs["camera"], []).append(obs)
 
+    _mc_log("=" * 70)
+    _mc_log(f"[MERGE-START] cameras={list(observations_by_camera.keys())}  "
+            f"total_obs={len(observations)}")
+    for cam, items in sorted(observations_by_camera.items()):
+        for item in items:
+            t = item["truck"]
+            _mc_log(
+                f"  {cam}/T#{t.get('track_id','?')}  "
+                f"window=[{t.get('first_seen_time_sec','?')}s – {t.get('last_seen_time_sec','?')}s]  "
+                f"dur={t.get('duration_sec','?')}s  type={t.get('type','?')}"
+            )
+
     group_specs: list[tuple[list[dict[str, Any]], str | None, float | None]]
     if MULTI_CAMERA_GATE_MODE:
         # Gate setup: one vehicle at a time, all cameras see the same truck.
@@ -933,52 +1280,83 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     ):
         # Common gate setup: each camera is looking at the same truck from a different angle.
         group_specs = [(observations, "assume_single_entity", 0.5)]
+    elif TRUCK_TIME_BOUNDARIES:
+        # PRIMARY STRATEGY (boundaries known): group by fixed truck-window.
+        # After splitting at the boundaries, every observation lies inside exactly
+        # one window, and one window == one physical truck.  This is robust to
+        # rear/front cameras that barely overlap and to a single camera producing
+        # several short re-tracks of the same truck.
+        group_specs = []
+        for window_group in _group_observations_by_window(observations, TRUCK_TIME_BOUNDARIES):
+            if len(window_group) > 1:
+                method = "truck_window"
+                confidence = 0.9
+            else:
+                method = "truck_window_single"
+                confidence = 0.6
+            group_specs.append((window_group, method, confidence))
     else:
-        camera_counts = {len(items) for items in observations_by_camera.values()}
-        if (
-            MULTI_CAMERA_ORDER_FALLBACK
-            and len(observations_by_camera) > 1
-            and len(camera_counts) == 1
-        ):
-            ordered_by_camera = {
-                camera: sorted(items, key=_truck_sort_key)
-                for camera, items in sorted(observations_by_camera.items(), key=lambda item: _camera_sort_key(item[0]))
-            }
-            trucks_per_camera = next(iter(camera_counts))
-            group_specs = []
-            for index in range(trucks_per_camera):
-                group = [items[index] for items in ordered_by_camera.values()]
-                _identity_keys_for_group, method, confidence = _group_identity_summary(group)
-                if method == "order_fallback":
-                    method = "same_count_order"
-                elif method == "partial_identity_order":
-                    method = "same_count_partial_identity"
-                elif method == "conflicting_identity_order":
-                    method = "same_count_conflicting_identity"
-                group_specs.append((group, method, confidence))
-        else:
-            identity_groups: dict[str, list[dict[str, Any]]] = {}
-            no_identity = []
-            for obs in observations:
-                key = _identity_key(obs["truck"])
-                if key:
-                    identity_groups.setdefault(key, []).append(obs)
-                else:
-                    no_identity.append(obs)
+        # FALLBACK (no boundaries): group ALL observations by temporal overlap.
+        # Observations from different cameras that are active at the same time
+        # are the same physical truck — regardless of camera count or identity keys.
+        # Same-camera observations are never merged (they are distinct trucks).
+        group_specs = []
+        for time_group in _group_observations_by_time(observations):
+            if len(time_group) > 1:
+                _identity_keys_for_group, method, confidence = _group_identity_summary(time_group)
+                if method in ("order_fallback", "conflicting_identity_order"):
+                    method = "temporal_overlap"
+                    confidence = 0.6
+            else:
+                method = "single_camera_unmatched"
+                confidence = 0.25
+            group_specs.append((time_group, method, confidence))
 
-            group_specs = [
-                (group, "exact_identity", 0.96 if len(group) > 1 else 0.45)
-                for group in identity_groups.values()
-            ]
-            group_specs.extend(([obs], "single_camera_unmatched", 0.25) for obs in no_identity)
-
-    trucks_out: dict[str, dict[str, Any]] = {}
     _roles = MULTI_CAMERA_CAMERA_ROLES if MULTI_CAMERA_CAMERA_ROLES else None
+    _mc_log(f"[MERGE-GROUPS] {len(group_specs)} group(s) to merge:")
+    merged_entities: list[dict[str, Any]] = []
     for index, (group, match_method, match_confidence) in enumerate(group_specs, start=1):
-        trucks_out[str(index)] = _merge_truck_group(index, group, match_method, match_confidence, _roles)
+        labels = ", ".join(
+            f"{g['camera']}/T#{g['truck'].get('track_id','?')}"
+            for g in group
+        )
+        _mc_log(f"  group {index}: [{labels}]  method={match_method}  conf={match_confidence}")
+        merged_entities.append(_merge_truck_group(index, group, match_method, match_confidence, _roles))
+
+    # Issue 7 — suppress ghost detections: an entity with NO identifying data
+    # (container number, license plate, truck number) AND a duration under 5 s is a
+    # momentary misclassification at a camera handoff, not a real truck.
+    kept_entities: list[dict[str, Any]] = []
+    for entity in merged_entities:
+        info = entity.get("associated_info") or {}
+        has_data = any(
+            _field_text(info.get(field)).strip()
+            for field in ("container_number", "license_plate", "truck_number")
+        )
+        dur = entity.get("duration_sec")
+        is_ghost = (not has_data) and (dur is not None and float(dur) < 5.0)
+        if is_ghost:
+            _mc_log(
+                f"  [GHOST-DROP] entity cameras=[{entity.get('camera')}] "
+                f"dur={dur}s — no container/plate/truck_number, suppressed"
+            )
+            continue
+        kept_entities.append(entity)
+
+    # Renumber surviving entities so IDs stay contiguous 1..N.
+    trucks_out: dict[str, dict[str, Any]] = {}
+    for new_index, entity in enumerate(kept_entities, start=1):
+        entity["track_id"] = new_index
+        fusion = entity.get("associated_info", {}).get("_fusion")
+        if isinstance(fusion, dict):
+            fusion["entity_track_id"] = new_index
+        trucks_out[str(new_index)] = entity
 
     with_container = sum(1 for truck in trucks_out.values() if truck["type"] == "truck_with_container")
     without_container = sum(1 for truck in trucks_out.values() if truck["type"] == "truck_without_container")
+    _mc_log(f"[MERGE-DONE] {len(trucks_out)} entity(s)  "
+            f"with_container={with_container}  without_container={without_container}")
+    _mc_log("=" * 70)
     return {
         "session": {
             "video_path": ", ".join(camera_payloads.keys()),
