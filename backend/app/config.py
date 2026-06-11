@@ -17,7 +17,11 @@ class Settings(BaseSettings):
     multi_camera_assume_single_entity: bool = False
     multi_camera_review_threshold: float = 0.75
     multi_camera_gate_mode: bool = False
-    multi_camera_camera_roles: str = ""
+    # Per-camera field authority.  The rear camera runs best_V2.pt, whose only OCR
+    # classes are the truck cab fields, so it is the authoritative source for them:
+    # its reads win even against a higher-confidence (but wrong) read from a
+    # front/left/right camera running best.pt.
+    multi_camera_camera_roles: str = "back:truck_number,truck_company,driver"
     track_fragment_merge_gap_seconds: float = 20.0
     track_fragment_merge_aggressive: bool = True
     # Fixed ground-truth truck-changeover timestamps for the gate.  Any track that

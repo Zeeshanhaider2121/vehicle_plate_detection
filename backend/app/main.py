@@ -103,6 +103,28 @@ def _parse_camera_time_offsets(raw: str) -> dict[str, float]:
     return offsets
 
 
+_VIDEO_TS_RE = re.compile(r"(\d{14})")
+
+
+def _parse_video_start_time(video_path: str | None) -> datetime | None:
+    """Extract the NVR start timestamp from a video filename.
+
+    NVR clips are named like
+    ``Front.IN_LANE_2_LPR_NVR_20260525131102_20260525132001_827960.mp4``
+    where the first 14-digit token (YYYYMMDDHHMMSS) is the recording start.
+    Returns None when no parseable timestamp is present.
+    """
+    if not video_path:
+        return None
+    matches = _VIDEO_TS_RE.findall(str(video_path))
+    if not matches:
+        return None
+    try:
+        return datetime.strptime(matches[0], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+
+
 def _parse_camera_roles(raw: str) -> dict[str, set[str]]:
     """Parse 'front:f1,f2;left:f3' into {camera: {fields}}."""
     roles: dict[str, set[str]] = {}
@@ -543,19 +565,43 @@ def _group_observations_by_window(
     return groups
 
 
-def _apply_camera_time_offset(truck: dict[str, Any], camera: str) -> dict[str, Any]:
-    offset = CAMERA_TIME_OFFSETS_SECONDS.get(camera, 0.0)
+def _apply_camera_time_offset(
+    truck: dict[str, Any],
+    camera: str,
+    offsets: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    """Shift a camera's observation onto the common (reference-camera) timeline.
+
+    `offsets` (camera -> seconds, derived from the NVR filename start times) takes
+    precedence over the static config table.  Both the truck's seen-window AND the
+    per-field `_ocr_history` capture times are shifted by the same offset, so the
+    boundary-split + window attribution downstream stays internally consistent.
+    """
+    table = offsets if offsets is not None else CAMERA_TIME_OFFSETS_SECONDS
+    offset = table.get(camera, 0.0)
     if not offset:
         truck["time_offset_sec"] = 0.0
         return truck
     adjusted = dict(truck)
     adjusted["time_offset_sec"] = offset
-    for key in ("first_seen_time_sec", "last_seen_time_sec", "duration_sec"):
-        if adjusted.get(key) is None:
-            continue
-        if key == "duration_sec":
-            continue
-        adjusted[key] = round(float(adjusted[key]) + offset, 3)
+    for key in ("first_seen_time_sec", "last_seen_time_sec"):
+        if adjusted.get(key) is not None:
+            adjusted[key] = round(float(adjusted[key]) + offset, 3)
+    info = adjusted.get("associated_info")
+    if isinstance(info, dict) and isinstance(info.get("_ocr_history"), dict):
+        new_hist = copy.deepcopy(info["_ocr_history"])
+        for field_hist in new_hist.values():
+            if not isinstance(field_hist, dict):
+                continue
+            for entry in field_hist.values():
+                if not isinstance(entry, dict):
+                    continue
+                for tkey in ("time_first_sec", "time_last_sec"):
+                    if entry.get(tkey) is not None:
+                        entry[tkey] = round(float(entry[tkey]) + offset, 3)
+        new_info = dict(info)
+        new_info["_ocr_history"] = new_hist
+        adjusted["associated_info"] = new_info
     return adjusted
 
 
@@ -651,12 +697,35 @@ def _merge_truck_group(
         if truck.get("last_seen_time_sec") is not None:
             last_times.append(float(truck["last_seen_time_sec"]))
 
+        # Per-camera detection window, reported in THAT camera's own local time
+        # (undo the alignment offset) so the UI can show "FRONT 0:00–2:01,
+        # BACK 2:00–2:10" — i.e. when each camera actually saw this truck.
+        cam_offset = float(truck.get("time_offset_sec", 0.0) or 0.0)
+        local_first = (
+            round(float(truck["first_seen_time_sec"]) - cam_offset, 3)
+            if truck.get("first_seen_time_sec") is not None
+            else None
+        )
+        local_last = (
+            round(float(truck["last_seen_time_sec"]) - cam_offset, 3)
+            if truck.get("last_seen_time_sec") is not None
+            else None
+        )
+        detected_fields = [f for f in OCR_FIELD_KEYS if _field_text(info.get(f))]
         camera_observations.append(
             {
                 "entity_track_id": entity_id,
                 "camera": camera,
                 "source_track_id": truck.get("track_id"),
-                "time_offset_sec": truck.get("time_offset_sec", 0.0),
+                "time_offset_sec": cam_offset,
+                "first_seen_time_sec": local_first,
+                "last_seen_time_sec": local_last,
+                "duration_sec": (
+                    round(local_last - local_first, 3)
+                    if local_first is not None and local_last is not None
+                    else None
+                ),
+                "detected_fields": detected_fields,
                 "source_identity_keys": _identity_keys(truck),
                 "truck_type": truck.get("type"),
                 "confidence_avg": truck.get("confidence_avg"),
@@ -667,18 +736,63 @@ def _merge_truck_group(
         )
 
     # Camera-role-aware field merging.
-    # For each field, process authoritative-camera observations first so they win
-    # tiebreaks against equal-confidence reads from off-role cameras.
+    # A field "owned" by one or more cameras (e.g. back owns truck_number /
+    # truck_company because best_V2 is the only model that reads them) is taken
+    # EXCLUSIVELY from those cameras whenever any of them actually read it — an
+    # off-role camera can never override an authoritative read, even at higher
+    # confidence.  Fields with no owner (or whose owners read nothing) fall back
+    # to a normal best-of-all-cameras merge.
     for field in OCR_FIELD_KEYS:
+        candidates = observations
         if camera_roles:
-            auth = [o for o in observations if field in (camera_roles.get(o["camera"]) or set())]
-            other = [o for o in observations if o not in auth]
-            ordered = auth + other
-        else:
-            ordered = observations
-        for obs in ordered:
+            owners = {cam for cam, fields in camera_roles.items() if field in fields}
+            if owners:
+                auth = [o for o in observations if o["camera"] in owners]
+                if any(
+                    _field_text((o["truck"].get("associated_info") or {}).get(field))
+                    for o in auth
+                ):
+                    candidates = auth
+        for obs in candidates:
             info = obs["truck"].get("associated_info") or {}
             merged_info[field] = _better_field(merged_info.get(field), info.get(field))
+
+    # Carry the time-stamped OCR history forward (union across observations).  This
+    # is essential: when a continuous track is later split at a truck-changeover
+    # boundary, _assign_ocr_fields_to_window re-picks each field from the reading
+    # captured inside that window — which only works if the history survives the
+    # per-camera fragment merge.  Without this, both halves of a split inherit the
+    # single pre-split value (e.g. back truck_number 801552 leaking onto truck 2).
+    merged_history: dict[str, dict[str, Any]] = {}
+    for obs in observations:
+        hist = (obs["truck"].get("associated_info") or {}).get("_ocr_history")
+        if not isinstance(hist, dict):
+            continue
+        for hist_field, variants in hist.items():
+            if not isinstance(variants, dict):
+                continue
+            dst = merged_history.setdefault(hist_field, {})
+            for vkey, entry in variants.items():
+                if not isinstance(entry, dict):
+                    continue
+                if vkey not in dst:
+                    dst[vkey] = copy.deepcopy(entry)
+                    continue
+                ex = dst[vkey]
+                ex["count"] = int(ex.get("count", 0)) + int(entry.get("count", 0))
+                if float(entry.get("confidence", 0)) > float(ex.get("confidence", 0)):
+                    ex["confidence"] = entry.get("confidence")
+                    ex["text"] = entry.get("text", ex.get("text"))
+                if entry.get("time_first_sec") is not None:
+                    ex["time_first_sec"] = min(
+                        ex.get("time_first_sec", entry["time_first_sec"]), entry["time_first_sec"]
+                    )
+                if entry.get("time_last_sec") is not None:
+                    ex["time_last_sec"] = max(
+                        ex.get("time_last_sec", entry["time_last_sec"]), entry["time_last_sec"]
+                    )
+    if merged_history:
+        merged_info["_ocr_history"] = merged_history
 
     field_validation = _build_field_validation(merged_info)
     invalid_fields = [
@@ -1193,6 +1307,49 @@ def _split_observation_at_boundaries(
     return result
 
 
+def _derive_camera_sessions(
+    camera_payloads: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], dict[str, float]]:
+    """Read each camera's NVR start time + clip length from its session/filename.
+
+    Returns (camera_sessions, offsets) where offsets aligns every camera onto the
+    reference camera's timeline (front if present, else the earliest-starting
+    camera).  offset[cam] = cam_start - reference_start, so adding it to a camera's
+    local time yields the common-timeline value.  Cameras without a parseable
+    timestamp keep the static-config offset (default 0) and report no start time.
+    """
+    starts: dict[str, datetime] = {}
+    sessions: dict[str, dict[str, Any]] = {}
+    for camera, payload in camera_payloads.items():
+        session = payload.get("session") or {}
+        video_path = session.get("video_path") or ""
+        start_dt = _parse_video_start_time(video_path)
+        fps = float(session["video_fps"]) if session.get("video_fps") else None
+        total = int(session["total_frames"]) if session.get("total_frames") else None
+        duration = round(total / fps, 1) if fps and total else None
+        sessions[camera] = {
+            "camera": camera,
+            "video_filename": Path(video_path).name if video_path else None,
+            "start_time": start_dt.strftime("%H:%M:%S") if start_dt else None,
+            "start_datetime": start_dt.isoformat() if start_dt else None,
+            "fps": round(fps, 2) if fps else None,
+            "total_frames": total,
+            "processed_duration_sec": duration,
+            "model": session.get("model"),
+        }
+        if start_dt is not None:
+            starts[camera] = start_dt
+
+    offsets: dict[str, float] = dict(CAMERA_TIME_OFFSETS_SECONDS)
+    if starts:
+        reference = starts.get("front") or min(starts.values())
+        for camera, start_dt in starts.items():
+            offsets[camera] = round((start_dt - reference).total_seconds(), 3)
+    for camera in sessions:
+        sessions[camera]["time_offset_sec"] = offsets.get(camera, 0.0)
+    return sessions, offsets
+
+
 def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
     observations: list[dict[str, Any]] = []
     total_frames = 0
@@ -1200,6 +1357,10 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     fps_values: list[float] = []
     devices: set[str] = set()
     models: set[str] = set()
+
+    camera_sessions, effective_offsets = _derive_camera_sessions(camera_payloads)
+    _mc_log(f"[CAMERA-SYNC] offsets(sec)={effective_offsets}  "
+            f"starts={ {c: s.get('start_time') for c, s in camera_sessions.items()} }")
 
     for camera, payload in camera_payloads.items():
         session = payload.get("session") or {}
@@ -1221,7 +1382,7 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             for merged_truck in _merge_track_fragments(trucks):
                 obs: dict[str, Any] = {
                     "camera": camera,
-                    "truck": _apply_camera_time_offset(merged_truck, camera),
+                    "truck": _apply_camera_time_offset(merged_truck, camera, effective_offsets),
                 }
                 # Split long observations at configured boundaries
                 # (e.g. back/T#1 [121–456s] splits at 130s → truck-1 piece + truck-2 piece)
@@ -1242,7 +1403,8 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
                 "device": ", ".join(sorted(devices)) or None,
                 "model": ", ".join(sorted(models)) or None,
                 "frames_processed": frames_processed or None,
-                "camera_time_offsets_seconds": CAMERA_TIME_OFFSETS_SECONDS,
+                "camera_time_offsets_seconds": effective_offsets,
+                "camera_sessions": camera_sessions,
             },
             "summary": {
                 "total_trucks_tracked": 0,
@@ -1269,7 +1431,27 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             )
 
     group_specs: list[tuple[list[dict[str, Any]], str | None, float | None]]
-    if MULTI_CAMERA_GATE_MODE:
+    if TRUCK_TIME_BOUNDARIES:
+        # PRIMARY STRATEGY (boundaries known): group by fixed truck-window.
+        # After splitting at the boundaries, every observation lies inside exactly
+        # one window, and one window == one physical truck.  This is robust to
+        # rear/front cameras that barely overlap and to a single camera producing
+        # several short re-tracks of the same truck.
+        #
+        # Boundaries are the most specific ground-truth signal we have for "how many
+        # trucks and when", so they intentionally take precedence over gate mode and
+        # single-entity mode — a stray MULTI_CAMERA_GATE_MODE=true must NOT collapse a
+        # multi-truck recording into one row.
+        group_specs = []
+        for window_group in _group_observations_by_window(observations, TRUCK_TIME_BOUNDARIES):
+            if len(window_group) > 1:
+                method = "truck_window"
+                confidence = 0.9
+            else:
+                method = "truck_window_single"
+                confidence = 0.6
+            group_specs.append((window_group, method, confidence))
+    elif MULTI_CAMERA_GATE_MODE:
         # Gate setup: one vehicle at a time, all cameras see the same truck.
         # Merge every observation regardless of per-camera count.
         group_specs = [(observations, "gate_mode", 0.95)]
@@ -1280,21 +1462,6 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     ):
         # Common gate setup: each camera is looking at the same truck from a different angle.
         group_specs = [(observations, "assume_single_entity", 0.5)]
-    elif TRUCK_TIME_BOUNDARIES:
-        # PRIMARY STRATEGY (boundaries known): group by fixed truck-window.
-        # After splitting at the boundaries, every observation lies inside exactly
-        # one window, and one window == one physical truck.  This is robust to
-        # rear/front cameras that barely overlap and to a single camera producing
-        # several short re-tracks of the same truck.
-        group_specs = []
-        for window_group in _group_observations_by_window(observations, TRUCK_TIME_BOUNDARIES):
-            if len(window_group) > 1:
-                method = "truck_window"
-                confidence = 0.9
-            else:
-                method = "truck_window_single"
-                confidence = 0.6
-            group_specs.append((window_group, method, confidence))
     else:
         # FALLBACK (no boundaries): group ALL observations by temporal overlap.
         # Observations from different cameras that are active at the same time
@@ -1326,22 +1493,30 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     # Issue 7 — suppress ghost detections: an entity with NO identifying data
     # (container number, license plate, truck number) AND a duration under 5 s is a
     # momentary misclassification at a camera handoff, not a real truck.
-    kept_entities: list[dict[str, Any]] = []
-    for entity in merged_entities:
-        info = entity.get("associated_info") or {}
-        has_data = any(
-            _field_text(info.get(field)).strip()
-            for field in ("container_number", "license_plate", "truck_number")
-        )
-        dur = entity.get("duration_sec")
-        is_ghost = (not has_data) and (dur is not None and float(dur) < 5.0)
-        if is_ghost:
-            _mc_log(
-                f"  [GHOST-DROP] entity cameras=[{entity.get('camera')}] "
-                f"dur={dur}s — no container/plate/truck_number, suppressed"
+    #
+    # Exception: when ground-truth changeover boundaries are configured, every
+    # non-empty window IS a real physical truck by definition (e.g. truck 3 may be
+    # seen by only one camera with no readable OCR).  Suppressing here would drop a
+    # legitimate gate event, so ghost filtering is skipped in window mode.
+    if TRUCK_TIME_BOUNDARIES:
+        kept_entities = list(merged_entities)
+    else:
+        kept_entities = []
+        for entity in merged_entities:
+            info = entity.get("associated_info") or {}
+            has_data = any(
+                _field_text(info.get(field)).strip()
+                for field in ("container_number", "license_plate", "truck_number")
             )
-            continue
-        kept_entities.append(entity)
+            dur = entity.get("duration_sec")
+            is_ghost = (not has_data) and (dur is not None and float(dur) < 5.0)
+            if is_ghost:
+                _mc_log(
+                    f"  [GHOST-DROP] entity cameras=[{entity.get('camera')}] "
+                    f"dur={dur}s — no container/plate/truck_number, suppressed"
+                )
+                continue
+            kept_entities.append(entity)
 
     # Renumber surviving entities so IDs stay contiguous 1..N.
     trucks_out: dict[str, dict[str, Any]] = {}
@@ -1366,7 +1541,8 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             "device": ", ".join(sorted(devices)) or None,
             "model": ", ".join(sorted(models)) or None,
             "frames_processed": frames_processed or None,
-            "camera_time_offsets_seconds": CAMERA_TIME_OFFSETS_SECONDS,
+            "camera_time_offsets_seconds": effective_offsets,
+            "camera_sessions": camera_sessions,
         },
         "summary": {
             "total_trucks_tracked": len(trucks_out),

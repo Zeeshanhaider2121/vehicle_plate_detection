@@ -59,21 +59,71 @@ const menuItems = [
 
 function cleanOcrText(text) {
   if (text === null || text === undefined) return text;
-  // Strip decorative '#' and '$' characters that leak in from OCR / markdown
-  // (e.g. "# CA-40761" -> "CA-40761", "## REAR" -> "REAR"), then collapse spaces.
-  return String(text).replace(/[#$]/g, "").replace(/\s+/g, " ").trim();
+  // Strip decorative markdown/OCR artifacts:
+  //  - '#' and '$' (e.g. "# CA-40761" -> "CA-40761", "$$ 4 6 $$" -> "4 6")
+  //  - middle-dot '·' that OCR substitutes for '-' (e.g. "CA·40761" -> "CA-40761")
+  // then collapse runs of single digits separated by spaces ("4 6" -> "46")
+  // and collapse remaining whitespace.
+  let out = String(text).replace(/[#$]/g, "").replace(/·/g, "-").replace(/\s+/g, " ").trim();
+  // Join space-separated single digits the OCR emits as math ("4 6 7" -> "467").
+  out = out.replace(/(?<=\d)\s+(?=\d)/g, "");
+  return out.trim();
+}
+
+const _GARBAGE_PHRASES = [
+  "abstract grayscale", "abstract gray", "grayscale curved",
+  "curved shape", "simple geometric", "no text or symbols",
+  "no visible text", "no text", "not visible", "no symbols",
+  "close-up of", "close up of", "photograph of",
+  "background with", "metallic", "cylindrical",
+  "image of", "picture of", "image shows",
+];
+// A real plate / container / truck-number token: 4-12 alphanumerics containing a digit.
+const _ID_TOKEN = /[A-Za-z0-9]{4,12}/g;
+function isGarbageOcr(text) {
+  if (!text) return false;
+  const str = String(text);
+  const lower = str.toLowerCase();
+  if (_GARBAGE_PHRASES.some(p => lower.includes(p))) return true;
+  // Long text with no plausible identifier token (4-12 chars containing a digit) is a caption.
+  if (str.length > 30) {
+    const hasIdToken = (str.match(_ID_TOKEN) || []).some(tok => /\d/.test(tok));
+    if (!hasIdToken) return true;
+  }
+  return false;
 }
 
 function readOcrFieldValue(value) {
   if (value === null || value === undefined) return "—";
-  if (typeof value === "string") return cleanOcrText(value) || "—";
-  if (typeof value === "object" && value.text) return cleanOcrText(value.text) || "—";
+  if (typeof value === "string") return isGarbageOcr(value) ? "—" : (cleanOcrText(value) || "—");
+  if (typeof value === "object" && value.text) return isGarbageOcr(value.text) ? "—" : (cleanOcrText(value.text) || "—");
   return "—";
 }
 
-// The truck company is always one of these two real carriers. OCR often reads it
-// wrong (e.g. "MAYA Organized Inc"), so snap whatever was read to the closest one.
-const KNOWN_TRUCK_COMPANIES = ["OCEANLAND INC", "OCEANHUB INC"];
+// The truck company is one of these real carriers (read by the rear best_V2 model).
+// OCR often mangles it, so snap whatever was read to the closest one — but only
+// when it is actually close, otherwise the cleaned text is shown as-is.
+const KNOWN_TRUCK_COMPANIES = ["SEAPORT INTERNATIONAL", "AIR AND OCEANLAND INC"];
+
+// A truck number uniquely identifies its carrier. The back model reads the number
+// reliably even when the company text itself is unreadable, so map known numbers to
+// their company and let that win. Edit this map as new trucks/carriers are added.
+const TRUCK_NUMBER_TO_COMPANY = {
+  "801552": "SEAPORT INTERNATIONAL",
+  "463": "AIR AND OCEANLAND INC"
+};
+
+function companyFromTruckNumber(truckNumber) {
+  if (!truckNumber || truckNumber === "—") return null;
+  const digits = String(truckNumber).replace(/[^A-Za-z0-9]/g, "");
+  if (!digits) return null;
+  if (TRUCK_NUMBER_TO_COMPANY[digits]) return TRUCK_NUMBER_TO_COMPANY[digits];
+  // Tolerate leading-zero / partial reads, e.g. "0801552" or "801552KY" -> 801552.
+  for (const [num, company] of Object.entries(TRUCK_NUMBER_TO_COMPANY)) {
+    if (digits === num || digits.endsWith(num) || digits.startsWith(num)) return company;
+  }
+  return null;
+}
 
 function levenshtein(a, b) {
   const m = a.length;
@@ -91,14 +141,16 @@ function levenshtein(a, b) {
 
 function normalizeTruckCompany(value) {
   if (value === null || value === undefined || value === "—") return value;
-  const text = String(value).trim();
-  if (!text) return "—";
-  const lower = text.toLowerCase();
+  const cleaned = cleanOcrText(String(value).trim());
+  if (!cleaned) return "—";
+  const lower = cleaned.toLowerCase();
   // Distinguishing tokens win immediately.
-  if (lower.includes("hub")) return "OCEANHUB INC";
-  if (lower.includes("land") || lower.includes("ocean")) return "OCEANLAND INC";
-  // Otherwise pick the closest canonical name by edit distance (ties -> first).
-  let best = KNOWN_TRUCK_COMPANIES[0];
+  if (lower.includes("seaport") || lower.includes("sea port")) return "SEAPORT INTERNATIONAL";
+  if (lower.includes("oceanland") || lower.includes("ocean land") || lower.includes("oceanhub")) return "AIR AND OCEANLAND INC";
+  // Otherwise pick the closest canonical name by edit distance, but only accept
+  // it as a match when it is reasonably close — a far-off string (or a different
+  // real carrier) is left as the cleaned OCR text rather than force-snapped.
+  let best = null;
   let bestDist = Infinity;
   for (const cand of KNOWN_TRUCK_COMPANIES) {
     const d = levenshtein(lower, cand.toLowerCase());
@@ -107,7 +159,8 @@ function normalizeTruckCompany(value) {
       best = cand;
     }
   }
-  return best;
+  if (best && bestDist <= Math.ceil(best.length * 0.45)) return best;
+  return cleaned.toUpperCase();
 }
 
 function readOcrFieldConfidence(value) {
@@ -140,8 +193,12 @@ function readTruckFields(truck) {
     const cam = readOcrFieldCamera(info[f]);
     if (cam) fieldCameras[f] = cam;
   }
-  // Constrain truck company to a known carrier name.
+  // Constrain truck company to a known carrier name, then let the truck number —
+  // the strongest identifier — decide the carrier when it is one we know (the back
+  // model reads the number reliably even when the company text OCR is weak/empty).
   fieldTexts.truck_company = normalizeTruckCompany(fieldTexts.truck_company);
+  const companyByNumber = companyFromTruckNumber(fieldTexts.truck_number);
+  if (companyByNumber) fieldTexts.truck_company = companyByNumber;
   // Show max OCR confidence across filled fields — reflects the best crop selected per class
   const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
   const maxOcrConf = ocrConfs.length > 0 ? Math.max(...ocrConfs).toFixed(3) : "—";
@@ -181,6 +238,48 @@ function formatTimeSec(sec) {
   const m = Math.floor(s / 60);
   const ss = Math.floor(s % 60).toString().padStart(2, "0");
   return `${m}:${ss}`;
+}
+
+// Human label for an OCR field key (e.g. "truck_number" -> "Truck No.").
+const FIELD_LABELS = {
+  container_company_logo: "Logo",
+  container_number: "Container No.",
+  container_side_no: "Side No.",
+  driver: "Driver",
+  license_plate: "Plate",
+  other_container_info: "Other",
+  truck_company: "Company",
+  truck_number: "Truck No."
+};
+
+// Per-merged-truck breakdown of which camera saw it and WHEN (in that camera's own
+// video time), plus which fields each camera read. Collapses to one row per camera.
+const _INTERNAL_CAMERAS = new Set(["", "track_fragment", "demo", "track_fragments"]);
+function readCameraObservations(truck) {
+  const obs = truck?.associated_info?._camera_observations;
+  if (!Array.isArray(obs)) return [];
+  const byCam = new Map();
+  for (const o of obs) {
+    const cam = (o?.camera || "").toLowerCase();
+    if (_INTERNAL_CAMERAS.has(cam)) continue;
+    const first = o.first_seen_time_sec;
+    const last = o.last_seen_time_sec;
+    const prev = byCam.get(cam);
+    if (!prev) {
+      byCam.set(cam, { camera: cam, first, last, fields: new Set(o.detected_fields || []) });
+    } else {
+      if (first != null && (prev.first == null || first < prev.first)) prev.first = first;
+      if (last != null && (prev.last == null || last > prev.last)) prev.last = last;
+      for (const f of (o.detected_fields || [])) prev.fields.add(f);
+    }
+  }
+  return [...byCam.values()]
+    .sort((a, b) => (a.first ?? 0) - (b.first ?? 0))
+    .map((c) => ({
+      camera: c.camera,
+      range: `${formatTimeSec(c.first)} – ${formatTimeSec(c.last)}`,
+      fields: [...c.fields].map((f) => FIELD_LABELS[f] || f)
+    }));
 }
 
 function stripOcrMarkdown(value) {
@@ -257,6 +356,7 @@ export default function App() {
   const [multiCamMode, setMultiCamMode] = useState(false);
   const [camFiles, setCamFiles] = useState({ front: null, right: null, back: null, left: null });
   const [camStreamUrls, setCamStreamUrls] = useState({ front: null, right: null, back: null, left: null });
+  const [cameraSessions, setCameraSessions] = useState([]);
   const [videoZoom, setVideoZoom] = useState(1);
   const videoRef = useRef(null);
   const streamFrameLoadingRef = useRef(false);
@@ -433,6 +533,10 @@ export default function App() {
         try {
           const snap = JSON.parse(status.json_snapshot);
           mergeSnapshotRows(snap?.trucks || {});
+          const camSessions = snap?.session?.camera_sessions;
+          if (camSessions && typeof camSessions === "object") {
+            setCameraSessions(Object.values(camSessions));
+          }
         } catch {
           // Ignore malformed snapshots and continue polling.
         }
@@ -496,6 +600,10 @@ export default function App() {
         try {
           const snap = JSON.parse(status.json_snapshot);
           mergeSnapshotRows(snap?.trucks || {});
+          const camSessions = snap?.session?.camera_sessions;
+          if (camSessions && typeof camSessions === "object") {
+            setCameraSessions(Object.values(camSessions));
+          }
         } catch { /* ignore */ }
       }
       if (status.state === "completed") return;
@@ -517,6 +625,7 @@ export default function App() {
       setActiveJobId("");
       setStreamFrameUrl("");
       setCamStreamUrls({ front: null, right: null, back: null, left: null });
+      setCameraSessions([]);
       streamFrameLoadingRef.current = false;
       lastRequestedFrameRef.current = "";
       setStreamWarning("");
@@ -991,6 +1100,19 @@ export default function App() {
                 </div>
               </div>
             </div>
+            {cameraSessions.length > 0 && (
+              <div className="camera-timeline-bar">
+                <span className="camera-timeline-label">Camera feeds</span>
+                {cameraSessions.map((cs) => (
+                  <span key={cs.camera} className={`camera-timeline-item cam-border-${cs.camera}`}>
+                    <b>{(cs.camera || "?").toUpperCase()}</b>
+                    {cs.start_time ? <> · start {cs.start_time}</> : null}
+                    {cs.processed_duration_sec != null ? <> · processed {formatTimeSec(cs.processed_duration_sec)}</> : null}
+                    {cs.time_offset_sec ? <span className="camera-timeline-offset"> (offset {cs.time_offset_sec > 0 ? "+" : ""}{cs.time_offset_sec}s)</span> : null}
+                  </span>
+                ))}
+              </div>
+            )}
             {dashboardView === "table" ? (
               <div className="table-wrap">
                 <table>
@@ -1012,8 +1134,8 @@ export default function App() {
                       <th>OCR Conf</th>
                       <th>Conf Avg</th>
                       <th>Duration</th>
-                      <th>First Seen</th>
-                      <th>Last Seen</th>
+                      <th>Start (m:ss)</th>
+                      <th>End (m:ss)</th>
                       <th>First Frame</th>
                       <th>Last Frame</th>
                       <th>BBox</th>
@@ -1031,7 +1153,10 @@ export default function App() {
                     {displayRows.map((truck) => {
                       const fields = readTruckFields(truck);
                       const status = truck.review_status || "pending";
-                      const sourceTracks = truck._sourceTracks || `T#${truck.track_id}`;
+                      const fusionLabels = truck?.associated_info?._fusion?.source_track_labels;
+                      const sourceTracks = truck._sourceTracks
+                        || (fusionLabels?.length ? fusionLabels.join(" + ") : null)
+                        || `T#${truck.track_id}`;
                       return (
                         <tr key={truck.id} className={status === "rejected" ? "row-rejected" : ""}>
                           <td>
@@ -1060,8 +1185,8 @@ export default function App() {
                           <td>{fields.ocr_confidence}</td>
                           <td>{fields.confidence}</td>
                           <td>{fields.durationSec}</td>
-                          <td>{fields.firstSeen}</td>
-                          <td>{fields.lastSeen}</td>
+                          <td title={`${fields.firstSeen}s`}>{formatTimeSec(fields.firstSeen)}</td>
+                          <td title={`${fields.lastSeen}s`}>{formatTimeSec(fields.lastSeen)}</td>
                           <td>{fields.firstSeenFrame}</td>
                           <td>{fields.lastSeenFrame}</td>
                           <td><span className="cell-truncate" title={fields.bbox}>{shortText(fields.bbox, 30)}</span></td>
@@ -1112,6 +1237,7 @@ export default function App() {
                     const timeRange = `${formatTimeSec(truck.first_seen_time_sec)} – ${formatTimeSec(truck.last_seen_time_sec)}`;
                     const duration = truck.duration_sec != null ? `${Number(truck.duration_sec).toFixed(1)}s` : "—";
                     const matchConf = fusion?.match_confidence ?? fields.confidence;
+                    const camObs = readCameraObservations(truck);
                     return (
                       <article key={truck.id} className={`gate-card ${status === "rejected" ? "gate-card-rejected" : ""}`}>
                         <div className="gate-card-header">
@@ -1123,7 +1249,20 @@ export default function App() {
                           {fields.camera && <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>}
                           <span className={`status-chip status-${status}`}>{status}</span>
                         </div>
-                        {(cameras.length > 0 || fields.camera) && (
+                        {camObs.length > 0 ? (
+                          <div className="gate-cam-timeline">
+                            <span className="gate-cameras-label">Seen by camera</span>
+                            {camObs.map((c) => (
+                              <div key={c.camera} className="gate-cam-row">
+                                <span className={`cam-source-chip cam-${c.camera}`}>{c.camera.toUpperCase()}</span>
+                                <span className="gate-cam-time">{c.range}</span>
+                                {c.fields.length > 0 && (
+                                  <span className="gate-cam-fields">read: {c.fields.join(", ")}</span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (cameras.length > 0 || fields.camera) ? (
                           <div className="gate-cameras">
                             <span className="gate-cameras-label">Source</span>
                             {cameras.length > 0
@@ -1133,11 +1272,8 @@ export default function App() {
                               : fields.camera
                                 ? <span className="gate-cam-badge">{fields.camera.toUpperCase()} <span className="gate-cam-track">T#{truck.track_id}</span></span>
                                 : null}
-                            {truck._groupCount > 1 && cameras.length === 0 && !fields.camera && (
-                              <span className="gate-cam-badge">{truck._sourceTracks}</span>
-                            )}
                           </div>
-                        )}
+                        ) : null}
                         <div className="gate-fields">
                           {fields.license_plate !== "—" && (
                             <div className="gate-field">
@@ -1169,6 +1305,14 @@ export default function App() {
                               <span className="gate-field-value">{fields.truck_company}</span>
                             </div>
                           )}
+                          <div className="gate-field">
+                            <span className="gate-field-label">Start Time</span>
+                            <span className="gate-field-value strong">{formatTimeSec(truck.first_seen_time_sec)}</span>
+                          </div>
+                          <div className="gate-field">
+                            <span className="gate-field-label">End Time</span>
+                            <span className="gate-field-value strong">{formatTimeSec(truck.last_seen_time_sec)}</span>
+                          </div>
                           <div className="gate-field">
                             <span className="gate-field-label">Duration</span>
                             <span className="gate-field-value">{duration}</span>
