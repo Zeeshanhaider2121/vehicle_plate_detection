@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -1242,6 +1242,7 @@ def _assign_ocr_fields_to_window(
         if not field_hist:
             continue  # no timing info for this field — keep deep-copied value as-is
         best = None
+        best_key = None
         for entry in field_hist.values():
             tf = entry.get("time_first_sec")
             tl = entry.get("time_last_sec", tf)
@@ -1249,7 +1250,10 @@ def _assign_ocr_fields_to_window(
                 continue
             mid = (float(tf) + float(tl)) / 2.0
             if seg_start <= mid <= seg_end:
-                if best is None or entry.get("confidence", 0.0) > best.get("confidence", 0.0):
+                # Majority vote within the window: most-read value wins, ties by confidence.
+                key = (int(entry.get("count", 0)), float(entry.get("confidence", 0.0)))
+                if best_key is None or key > best_key:
+                    best_key = key
                     best = entry
         if best is not None:
             piece_info[field] = {
@@ -1570,6 +1574,72 @@ def health() -> HealthResponse:
         environment=settings.app_env,
         local_inference_enabled=True,
     )
+
+
+@app.get("/api/ocr/status")
+def ocr_status() -> dict:
+    """MinerU OCR connectivity for the live UI indicator."""
+    import local_inference
+
+    try:
+        return local_inference.mineru_status(probe=True)
+    except Exception as exc:  # never let a probe failure break the UI
+        return {
+            "provider": "MinerU",
+            "status": "disconnected",
+            "token_configured": True,
+            "reachable": False,
+            "last_error": str(exc),
+        }
+
+
+@app.post("/api/ocr/token")
+def set_ocr_token(payload: dict = Body(...)) -> dict:
+    """Set the MinerU API token at runtime (from the UI) and re-probe."""
+    import local_inference
+
+    token = (payload or {}).get("token", "")
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(status_code=400, detail="A non-empty 'token' is required.")
+    if not local_inference.set_mineru_token(token):
+        raise HTTPException(status_code=400, detail="Failed to set MinerU token.")
+    return local_inference.mineru_status(probe=True)
+
+
+def _field_media_dir(job_id: str, track_id: str, field: str) -> tuple[Path, str]:
+    """Resolve the on-disk dir for a (job, truck, field)'s captured crops, with
+    path-traversal sanitisation. Returns (dir, safe_field)."""
+    import local_inference
+
+    safe_job = re.sub(r"[^A-Za-z0-9_-]", "", str(job_id))
+    safe_tid = re.sub(r"[^A-Za-z0-9_-]", "", str(track_id))
+    safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(field))
+    return Path(local_inference.FIELD_MEDIA_DIR) / safe_job / safe_tid / safe_field, safe_field
+
+
+@app.get("/api/field-media/{job_id}/{track_id}/{field}")
+def list_field_media(job_id: str, track_id: str, field: str) -> dict:
+    """List the captured crop frames (a replayable clip) for one field of one truck."""
+    media_dir, safe_field = _field_media_dir(job_id, track_id, field)
+    frames: list[str] = []
+    if media_dir.is_dir():
+        names = sorted(p.name for p in media_dir.glob("*.jpg"))
+        frames = [
+            f"/api/field-media/{job_id}/{track_id}/{safe_field}/frame/{i}"
+            for i in range(len(names))
+        ]
+    return {"job_id": job_id, "track_id": track_id, "field": safe_field, "count": len(frames), "frames": frames}
+
+
+@app.get("/api/field-media/{job_id}/{track_id}/{field}/frame/{index}")
+def get_field_media_frame(job_id: str, track_id: str, field: str, index: int) -> Response:
+    media_dir, _ = _field_media_dir(job_id, track_id, field)
+    if not media_dir.is_dir():
+        raise HTTPException(status_code=404, detail="No media for this field.")
+    names = sorted(p.name for p in media_dir.glob("*.jpg"))
+    if index < 0 or index >= len(names):
+        raise HTTPException(status_code=404, detail="Frame index out of range.")
+    return FileResponse(str(media_dir / names[index]), media_type="image/jpeg")
 
 
 @app.post("/api/detect", response_model=DetectResponse)
@@ -1950,7 +2020,7 @@ def get_multi_camera_job_status(job_id: str) -> MultiCameraAnalyzeStatusResponse
         if data.get("progress") is not None:
             progress_values.append(float(data["progress"]))
         if data.get("ocr_log"):
-            ocr_log.extend([f"[{camera}] {line}" for line in data.get("ocr_log", [])[-6:]])
+            ocr_log.extend([f"[{camera}] {line}" for line in data.get("ocr_log", [])])
         if data.get("json_snapshot"):
             try:
                 parsed = json.loads(data["json_snapshot"])
@@ -1986,7 +2056,7 @@ def get_multi_camera_job_status(job_id: str) -> MultiCameraAnalyzeStatusResponse
         message=f"{len(child_statuses)} camera jobs {state}.",
         cameras=child_statuses,
         json_snapshot=json.dumps(merged_snapshot),
-        ocr_log=ocr_log[-30:],
+        ocr_log=ocr_log[-4000:],
     )
 
 

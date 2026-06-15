@@ -123,3 +123,6 @@ __pycache__/
 *.rar
 *.7z
 platform_output/
+# Runtime MinerU token (set from UI)
+backend/.mineru_token
+.mineru_token

@@ -79,6 +79,10 @@ ENABLE_FRAME_SKIP = _env_bool("ENABLE_FRAME_SKIP", False)
 PROCESS_EVERY_N_FRAMES = _env_int("PROCESS_EVERY_N_FRAMES", 1)
 FRAME_SKIP = PROCESS_EVERY_N_FRAMES - 1 if ENABLE_FRAME_SKIP else 0
 OCR_EVERY_N_FRAMES = _env_int("OCR_EVERY_N_FRAMES", 1)
+# Only crops whose detection confidence clears this bar are sent to OCR. This is
+# a SEPARATE, stricter gate than the global detection CONF — a box can be drawn /
+# tracked at CONF but is only read by OCR when it is at least this confident.
+OCR_CONF_THRESH = _env_float("OCR_CONF_THRESH", 0.75)
 USE_HALF = True
 OCR_WORKERS = 6
 SAVE_CROPS = False
@@ -99,6 +103,41 @@ ACTIVE_WINDOW_FRAMES = _env_int("ACTIVE_WINDOW_FRAMES", 60)      # was 600
 HIGH_IOU_MERGE_THRESH = _env_float("HIGH_IOU_MERGE_THRESH", 0.95) # was 0.50
 
 MINERU_TOKEN = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI3NzgwMDYzMyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3OTExMzIyNiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiNWIxM2U3YjctN2FmNi00MzdjLThhZmEtMTIxNTRiMzQyOGQxIiwiZW1haWwiOiIiLCJleHAiOjE3ODY4ODkyMjZ9.gw3idlGC_R1ulaBBXCR_FtVszMw3y7jIbFBwQcjhgCbqVNJaoXTvtUp7GdvpMF117PPbzn1xrqm8YIybpxMN_Q"
+
+# Operators can paste a fresh MinerU token from the UI; it is persisted here and
+# reloaded on startup so it survives restarts (env var MINERU_TOKEN still wins on
+# first boot if set). Kept out of git via .gitignore.
+_MINERU_TOKEN_FILE = str(Path(__file__).resolve().parent / ".mineru_token")
+
+if os.getenv("MINERU_TOKEN"):
+    MINERU_TOKEN = os.getenv("MINERU_TOKEN")
+else:
+    try:
+        if os.path.exists(_MINERU_TOKEN_FILE):
+            with open(_MINERU_TOKEN_FILE, "r", encoding="utf-8") as _tf:
+                _saved = _tf.read().strip()
+            if _saved:
+                MINERU_TOKEN = _saved
+                print("[PlateFlow] Loaded MinerU token from .mineru_token")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[PlateFlow] Could not read persisted MinerU token: {_exc}")
+
+
+def set_mineru_token(token: str) -> bool:
+    """Set the MinerU token at runtime (used by the OCR engine immediately) and
+    persist it so it survives a restart. Returns True on success."""
+    global MINERU_TOKEN
+    token = (token or "").strip()
+    if not token:
+        return False
+    MINERU_TOKEN = token
+    try:
+        with open(_MINERU_TOKEN_FILE, "w", encoding="utf-8") as tf:
+            tf.write(token)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[PlateFlow] Could not persist MinerU token: {exc}")
+    return True
+
 
 CLASS_NAMES = [
     "container_company_logo",
@@ -616,6 +655,34 @@ def _extract_mineru_image(md_text: str) -> str | None:
     m = re.search(r"!\[\]\(([^)]+)\)", md_text)
     return m.group(1) if m else None
 
+
+def _pick_reading_by_count(field_hist: dict) -> dict | None:
+    """Pick the winning reading for a field by MAJORITY VOTE.
+
+    The same field is OCR'd across many frames; the value the operator should see
+    is the one read MOST OFTEN (max `count`), not merely the single highest-
+    confidence frame — e.g. "SUDU8227936" read 6× beats a one-off "SUOU8227936".
+    Ties break by confidence, then text quality, then shorter length.
+    """
+    best = None
+    best_key = None
+    for entry in (field_hist or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        text = entry.get("text", "")
+        if not text or _is_garbage_ocr(text):
+            continue
+        key = (
+            int(entry.get("count", 0)),
+            float(entry.get("confidence", 0.0)),
+            _text_quality(text),
+            -len(text),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best = entry
+    return best
+
 # ========================= TRUCK REGISTRY ====================================
 class TruckRegistry:
     _UNIFIED_TEMPLATE = {
@@ -702,6 +769,18 @@ class TruckRegistry:
                     entry["count"] += 1
                     if conf > entry["confidence"]:
                         entry["confidence"] = round(conf, 4)
+                # Final value = the reading seen MOST OFTEN across frames (majority
+                # vote), not just the single most-confident frame.
+                chosen = _pick_reading_by_count(field_hist)
+                if chosen is not None:
+                    info[field] = {
+                        "text": chosen["text"],
+                        "confidence": chosen.get("confidence", 0.0),
+                        "camera": chosen.get("camera", self.camera_source),
+                    }
+                    if image:
+                        info[field]["image"] = image
+                return
             existing = info.get(field)
             if existing is None or existing == "":
                 info[field] = {"text": text, "confidence": round(conf, 4), "camera": self.camera_source}
@@ -848,6 +927,65 @@ def _extract_md_from_zip(zip_url: str) -> str:
         return ""
     return ""
 
+# Runtime record of MinerU OCR connectivity, surfaced to the UI via the
+# /api/ocr/status endpoint so the operator can see whether reads are actually
+# reaching the MinerU service (it is the only OCR backend — on failure crops
+# simply return no text).
+_mineru_stats = {
+    "ok_calls": 0,
+    "failed_calls": 0,
+    "last_ok_ts": None,
+    "last_error": None,
+    "last_error_ts": None,
+}
+
+
+def _mineru_mark_ok() -> None:
+    _mineru_stats["ok_calls"] += 1
+    _mineru_stats["last_ok_ts"] = time.time()
+
+
+def _mineru_mark_fail(err: object) -> None:
+    _mineru_stats["failed_calls"] += 1
+    _mineru_stats["last_error"] = str(err)
+    _mineru_stats["last_error_ts"] = time.time()
+
+
+def mineru_status(probe: bool = True) -> dict:
+    """Report MinerU OCR connectivity for the UI status indicator.
+
+    `reachable` reflects a live lightweight probe of the MinerU host (when
+    `probe` is True); the `*_calls` counters reflect real OCR traffic so the
+    operator can tell connected-but-idle from actively-reading.
+    """
+    token_configured = bool(MINERU_TOKEN)
+    reachable: bool | None = None
+    probe_error: str | None = None
+    if probe and token_configured:
+        try:
+            resp = requests.get("https://mineru.net", timeout=4)
+            reachable = resp.status_code < 500
+        except requests.exceptions.RequestException as exc:
+            reachable = False
+            probe_error = str(exc)
+    if token_configured and reachable is not False:
+        status = "connected"
+    elif not token_configured:
+        status = "no_token"
+    else:
+        status = "disconnected"
+    return {
+        "provider": "MinerU",
+        "status": status,
+        "token_configured": token_configured,
+        "reachable": reachable,
+        "ok_calls": _mineru_stats["ok_calls"],
+        "failed_calls": _mineru_stats["failed_calls"],
+        "last_ok_ts": _mineru_stats["last_ok_ts"],
+        "last_error": probe_error or _mineru_stats["last_error"],
+    }
+
+
 def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
     if not MINERU_TOKEN:
         return ""
@@ -862,13 +1000,16 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
             payload = step1.json()
             if payload.get("code") != 0:
                 print(f"  ⚠️ MinerU: {payload.get('msg')}")
+                _mineru_mark_fail(payload.get("msg") or "non-zero response code")
                 continue
+            _mineru_mark_ok()
             batch_id = payload["data"]["batch_id"]
             upload_url = payload["data"]["file_urls"][0]
             put_resp = requests.put(upload_url, data=enc.tobytes(), timeout=30)
             if put_resp.status_code not in (200, 201):
                 print(f"  ⚠️ Upload failed: {put_resp.status_code}")
                 continue
+            print(f"  [MinerU] crop uploaded ({len(enc.tobytes())} bytes) → batch {batch_id[:10]}… polling for result", flush=True)
             poll_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
             for poll_i in range(20):
                 time.sleep(3)
@@ -893,8 +1034,10 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
             print(f"  ⚠️ MinerU: max polls reached (attempt {attempt + 1})")
         except requests.exceptions.Timeout:
             print(f"  ⚠️ MinerU S1/S2 timeout (attempt {attempt + 1}/{max_retries})")
+            _mineru_mark_fail(f"timeout (attempt {attempt + 1})")
         except requests.exceptions.RequestException as e:
             print(f"  ⚠️ MinerU request error: {e} (attempt {attempt + 1}/{max_retries})")
+            _mineru_mark_fail(e)
     return ""
 
 # ========================= VISUAL HELPERS ====================================
@@ -985,6 +1128,24 @@ def _det_key(track_id: int | None, frame_id: int, det_idx: int, truck_tid: int |
         return f"truck_{truck_tid}_{field}"
     return f"t{track_id}" if track_id is not None else f"f{frame_id}_i{det_idx}"
 
+FIELD_MEDIA_DIR = os.path.join(OUTPUT_DIR, "field_media")
+
+
+def _save_field_media(job_id: str, truck_tid: int, field: str, frame_id: int, crop_rgb: np.ndarray) -> None:
+    """Persist the exact crop we OCR'd for a (truck, field), so the UI can replay
+    the per-field captures as a short clip when the operator clicks that field."""
+    try:
+        if crop_rgb is None or getattr(crop_rgb, "size", 0) == 0:
+            return
+        safe_field = re.sub(r"[^A-Za-z0-9_.-]", "_", str(field))
+        out_dir = os.path.join(FIELD_MEDIA_DIR, str(job_id), str(truck_tid), safe_field)
+        os.makedirs(out_dir, exist_ok=True)
+        bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(os.path.join(out_dir, f"f{frame_id:06d}.jpg"), bgr)
+    except Exception as exc:  # noqa: BLE001 — media capture must never break OCR
+        print(f"  ⚠️ field media save failed: {exc}")
+
+
 def _enqueue_ocr(job_id: str, key: str, crop_rgb: np.ndarray, field: str, frame_id: int, truck_tid: int | None, truck_type: str | None, child_track_id: int | None = None, conf: float = 0.0) -> None:
     with _jobs_lock:
         job = JOBS.get(job_id)
@@ -1011,9 +1172,23 @@ def _ocr_worker() -> None:
                 truck_type = lock["truck_type"]
                 field = lock["field"]
                 print(f"  [OCR] using LOCKED association: child T#{child_track_id} → T#{truck_tid}")
+        crop_h, crop_w = (crop_rgb.shape[0], crop_rgb.shape[1]) if crop_rgb is not None and crop_rgb.size else (0, 0)
+        tid_label = f"T#{truck_tid}" if truck_tid is not None else "T#?"
+        send_log = f"[f{frame_id}] → SEND→OCR  field='{field}'  truck={tid_label}  conf={conf:.2f}  crop={crop_w}x{crop_h}"
+        print(f"  [OCR→SEND] {send_log}", flush=True)
+        with _jobs_lock:
+            _sj = JOBS.get(job_id)
+            if _sj is not None:
+                _sj.ocr_log.append(send_log)
+                _sj.ocr_log = _sj.ocr_log[-5000:]
         md_text = _call_mineru_ocr(crop_rgb)
         plain_text = _parse_mineru_markdown(md_text) if md_text else None
         image_path = _extract_mineru_image(md_text) if md_text else None
+        print(
+            f"  [OCR←RECV] [f{frame_id}] field='{field}'  raw_chars={len(md_text or '')}  "
+            f"parsed='{plain_text if plain_text else ''}'",
+            flush=True,
+        )
         with _jobs_lock:
             job = JOBS.get(job_id)
             if job is None:
@@ -1027,7 +1202,7 @@ def _ocr_worker() -> None:
             if plain_text:
                 job.ocr_cache[key] = plain_text
                 cam_prefix = f"[{job.camera_source}] " if job.camera_source else ""
-                log = f"[f{frame_id}] {cam_prefix}{field} → '{plain_text}'"
+                log = f"[f{frame_id}] {cam_prefix}← RECV←OCR  {field} → '{plain_text}'"
                 resolved_tid = truck_tid
                 resolved_type = truck_type or ""
                 if job.registry is not None:
@@ -1041,8 +1216,8 @@ def _ocr_worker() -> None:
                             rec = job.registry.trucks.get(candidate)
                             resolved_type = rec["type"] if rec else ""
                             job.registry.attach_ocr(resolved_tid, resolved_type, field, plain_text, conf, image_path, frame_id=frame_id)
-                            log += f"  (orphan → T#{resolved_tid})"
-                            print(f"  [OCR] ↩ orphan '{field}' rescued → T#{resolved_tid}")
+                            log += f"  (recovered → attached to T#{resolved_tid})"
+                            print(f"  [OCR] ↩ '{field}' had no in-frame truck box; recovered → attached to T#{resolved_tid}")
                         else:
                             if not _is_garbage_ocr(plain_text) and len(plain_text) <= 60 and len(job.orphan_buffer) < 30:
                                 job.orphan_buffer.append({"field": field, "text": plain_text, "conf": conf, "image": image_path})
@@ -1051,9 +1226,11 @@ def _ocr_worker() -> None:
                             else:
                                 log += "  (orphan — no compatible truck yet)"
                                 print(f"  [OCR] ⚠ orphan '{field}' — no compatible truck, dropping")
+                if resolved_tid is not None:
+                    _save_field_media(job_id, resolved_tid, field, frame_id, crop_rgb)
                 job.ocr_log.append(log)
-                job.ocr_log = job.ocr_log[-60:]
-                print(f"  [OCR] ✓ {key} → '{plain_text}'")
+                job.ocr_log = job.ocr_log[-5000:]
+                print(f"  [OCR] ✓ {key} → '{plain_text}'", flush=True)
             else:
                 job.submitted_keys.discard(key)
                 print(f"  [OCR] ✗ {key} — will retry")
@@ -1183,7 +1360,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                         registry.attach_ocr(candidate, rec["type"] if rec else "", item["field"], item["text"], item["conf"], item.get("image"))
                         rescued_log = f"[f{frame_id}] {item['field']} rescued → T#{candidate} '{item['text']}'"
                         job.ocr_log.append(rescued_log)
-                        job.ocr_log = job.ocr_log[-60:]
+                        job.ocr_log = job.ocr_log[-5000:]
                         print(f"  [OCR] ✅ orphan rescued: {rescued_log}")
                     else:
                         remaining.append(item)
@@ -1219,6 +1396,8 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         for i, (x1, y1, x2, y2, cls_id, conf_val, track_id, _mask) in enumerate(boxes_data):
             cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
             if cls_name not in OCR_CLASSES:
+                continue
+            if conf_val < OCR_CONF_THRESH:
                 continue
             if frame_id % OCR_EVERY_N_FRAMES != 0:
                 continue
@@ -1296,14 +1475,30 @@ def _run_job(job_id: str) -> None:
     try:
         _set_job(job_id, state="running", message="Video processing started.")
         _run_video_analysis(video_path, job=job)
-        deadline = time.time() + 600
-        while time.time() < deadline:
+        # Drain remaining OCR work. MinerU can be slow, so wait as long as the
+        # backlog keeps SHRINKING — only give up if the pending count stops
+        # decreasing for OCR_DRAIN_STALL_SECONDS (a genuine stall), with a high
+        # absolute ceiling. This lets long videos finish instead of timing out.
+        stall_limit = _env_float("OCR_DRAIN_STALL_SECONDS", 420.0)
+        hard_cap = _env_float("OCR_DRAIN_MAX_SECONDS", 7200.0)
+        start_ts = time.time()
+        last_pending = None
+        last_progress_ts = start_ts
+        while time.time() - start_ts < hard_cap:
             with _jobs_lock:
                 n_pending = len(JOBS[job_id].pending_keys)
             if n_pending == 0:
                 break
-            _set_job(job_id, message=f"Frames processed — waiting for {n_pending} OCR task(s) to complete…")
-            print(f"  [OCR-WAIT] {n_pending} task(s) still pending…")
+            now = time.time()
+            if last_pending is None or n_pending < last_pending:
+                last_pending = n_pending
+                last_progress_ts = now
+            elif now - last_progress_ts > stall_limit:
+                print(f"  [OCR-WAIT] stalled at {n_pending} pending for >{stall_limit:.0f}s — finalizing anyway")
+                break
+            waited = int(now - start_ts)
+            _set_job(job_id, message=f"Frames processed — waiting for {n_pending} OCR task(s) to complete… ({waited}s)")
+            print(f"  [OCR-WAIT] {n_pending} task(s) still pending… ({waited}s elapsed)")
             time.sleep(2)
         with _jobs_lock:
             job = JOBS[job_id]
@@ -1382,7 +1577,7 @@ def analyze_video_job_status(job_id: str) -> dict[str, Any]:
         job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found.")
-    return {"job_id": job.job_id, "state": job.state, "progress": job.progress, "frame_id": job.frame_id, "total_frames": job.total_frames, "fps": job.fps, "message": job.message, "error": job.error, "ocr_log": job.ocr_log[-20:], "json_snapshot": job.json_snapshot}
+    return {"job_id": job.job_id, "state": job.state, "progress": job.progress, "frame_id": job.frame_id, "total_frames": job.total_frames, "fps": job.fps, "message": job.message, "error": job.error, "ocr_log": list(job.ocr_log), "json_snapshot": job.json_snapshot}
 
 @app.get("/analyze-video/jobs/{job_id}/result")
 def analyze_video_job_result(job_id: str) -> dict[str, Any]:

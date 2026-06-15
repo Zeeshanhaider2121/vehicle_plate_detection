@@ -1,12 +1,15 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   fetchTruckRecords,
   finalizeMultiCamera,
+  fetchFieldMedia,
   finalizeVideoTruckRun,
   getMultiCameraFrameUrl,
   getMultiCameraStatus,
+  getOcrStatus,
   getVideoTruckRunFrameUrl,
   getVideoTruckRunStatus,
+  setOcrToken,
   startMultiCameraTruckRun,
   startVideoTruckRun
 } from "./api";
@@ -358,10 +361,146 @@ export default function App() {
   const [camStreamUrls, setCamStreamUrls] = useState({ front: null, right: null, back: null, left: null });
   const [cameraSessions, setCameraSessions] = useState([]);
   const [videoZoom, setVideoZoom] = useState(1);
+  const [ocrStatus, setOcrStatus] = useState(null);
+  const [expandedCam, setExpandedCam] = useState(null);
+  const [tokenInput, setTokenInput] = useState("");
+  const [tokenSaving, setTokenSaving] = useState(false);
+  const [tokenMsg, setTokenMsg] = useState("");
+  const [showAllLogs, setShowAllLogs] = useState(false);
+  const [fieldReplay, setFieldReplay] = useState(null);
   const videoRef = useRef(null);
   const streamFrameLoadingRef = useRef(false);
   const lastRequestedFrameRef = useRef("");
   const hasSelectedVideo = Boolean(videoFile || Object.values(camFiles).some(Boolean));
+
+  // Poll MinerU OCR connectivity so the operator always sees whether reads are
+  // reaching the OCR service. Polls faster while a job is actively processing.
+  useEffect(() => {
+    let cancelled = false;
+    async function check() {
+      try {
+        const status = await getOcrStatus();
+        if (!cancelled) setOcrStatus(status);
+      } catch {
+        if (!cancelled) {
+          setOcrStatus({ provider: "MinerU", status: "unreachable", reachable: false });
+        }
+      }
+    }
+    check();
+    const interval = processStatus === "processing" ? 8000 : 20000;
+    const id = setInterval(check, interval);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [processStatus]);
+
+  const ocrBadge = useMemo(() => {
+    const s = ocrStatus?.status;
+    if (!ocrStatus) return { cls: "checking", label: "OCR: checking…" };
+    if (s === "connected") {
+      const reading = (ocrStatus.ok_calls ?? 0) > 0;
+      return { cls: "connected", label: reading ? "MinerU OCR: connected · reading" : "MinerU OCR: connected" };
+    }
+    if (s === "no_token") return { cls: "error", label: "MinerU OCR: no API token" };
+    if (s === "unreachable") return { cls: "error", label: "OCR status: backend unreachable" };
+    return { cls: "error", label: "MinerU OCR: NOT connected" };
+  }, [ocrStatus]);
+
+  async function saveToken() {
+    const token = tokenInput.trim();
+    if (!token) return;
+    setTokenSaving(true);
+    setTokenMsg("");
+    try {
+      const status = await setOcrToken(token);
+      setOcrStatus(status);
+      setTokenInput("");
+      setTokenMsg(status?.status === "connected" ? "Token saved — MinerU connected." : "Token saved.");
+    } catch (error) {
+      setTokenMsg(error?.response?.data?.detail || error.message || "Failed to save token.");
+    } finally {
+      setTokenSaving(false);
+    }
+  }
+
+  async function openFieldReplay(truck, fieldKey, fieldValue, label) {
+    const trackId = truck?.track_id;
+    if (trackId == null) return;
+    if (!activeJobId) {
+      setFieldReplay({
+        open: true, loading: false, label, value: fieldValue, field: fieldKey,
+        frames: [], idx: 0, playing: false,
+        error: "Field clips are available for the run you process in this session."
+      });
+      return;
+    }
+    setFieldReplay({ open: true, loading: true, label, value: fieldValue, field: fieldKey, frames: [], idx: 0, playing: true, error: "" });
+    try {
+      const data = await fetchFieldMedia(activeJobId, trackId, fieldKey);
+      const frames = data?.frames || [];
+      setFieldReplay((prev) => (prev && prev.open
+        ? { ...prev, loading: false, frames, idx: 0, playing: frames.length > 1, error: frames.length ? "" : "No capture was recorded for this field." }
+        : prev));
+    } catch (e) {
+      setFieldReplay((prev) => (prev && prev.open
+        ? { ...prev, loading: false, error: e?.response?.data?.detail || e.message || "Failed to load field clip." }
+        : prev));
+    }
+  }
+
+  // Auto-advance the per-field clip frames like a looping video.
+  useEffect(() => {
+    if (!fieldReplay?.open || !fieldReplay.playing || (fieldReplay.frames?.length ?? 0) < 2) return undefined;
+    const id = setInterval(() => {
+      setFieldReplay((prev) => {
+        if (!prev || !prev.open || !prev.playing || (prev.frames?.length ?? 0) < 2) return prev;
+        return { ...prev, idx: (prev.idx + 1) % prev.frames.length };
+      });
+    }, 450);
+    return () => clearInterval(id);
+  }, [fieldReplay?.open, fieldReplay?.playing, fieldReplay?.frames?.length]);
+
+  // Table cell for an OCR field: the value is a clickable trigger that replays
+  // the captured crops for that (truck, field).
+  function ocrTd(truck, fields, key) {
+    const val = fields[key];
+    const cam = fields.fieldCameras?.[key];
+    const hasVal = val && val !== "—";
+    return (
+      <td>
+        <span className="cell-truncate" title={val}>
+          {hasVal ? (
+            <button
+              type="button"
+              className="field-clip-cell"
+              onClick={() => openFieldReplay(truck, key, val, FIELD_LABELS[key] || key)}
+              title="Play captured clip for this field"
+            >
+              {shortText(val, 20)}
+            </button>
+          ) : shortText(val, 20)}
+          {cam && <span className={`field-cam-tag cam-${cam}`}>{cam[0].toUpperCase()}</span>}
+        </span>
+      </td>
+    );
+  }
+
+  // Gate-card field value as a clickable clip trigger.
+  function clipValue(truck, key, value, extraClass = "") {
+    return (
+      <button
+        type="button"
+        className={`gate-field-value field-clip-value ${extraClass}`}
+        onClick={() => openFieldReplay(truck, key, value, FIELD_LABELS[key] || key)}
+        title="Play captured clip for this field"
+      >
+        {value}
+        <span className="field-clip-icon" aria-hidden>▶</span>
+      </button>
+    );
+  }
 
   function toggleVideo() {
     if (!videoRef.current) return;
@@ -379,7 +518,6 @@ export default function App() {
     detectedTrucks.find((truck) => truck.review_status === "pending") ||
     detectedTrucks[reviewIndex] ||
     null;
-  const currentFields = useMemo(() => readTruckFields(currentTruck), [currentTruck]);
 
   const counts = useMemo(() => {
     const summary = { detected: detectedTrucks.length, approved: 0, rejected: 0, pending: 0, withTrailer: 0, withoutTrailer: 0 };
@@ -491,13 +629,17 @@ export default function App() {
   }
 
   async function pollJobUntilComplete(jobId) {
-    const maxPolls = 900;
-    const maxRetries = 5;
+    const maxRetries = 8;
     const maxCachedPolls = 15;
+    const stallPolls = 300; // ~10 min of zero progress → give up
     let retries = 0;
     let cachedPolls = 0;
+    let bestFrame = -1;
+    let bestProgress = -1;
+    let bestLogLen = -1;
+    let pollsSinceProgress = 0;
 
-    for (let i = 0; i < maxPolls; i += 1) {
+    for (let i = 0; ; i += 1) {
       let status;
       try {
         status = await getVideoTruckRunStatus(jobId);
@@ -522,12 +664,8 @@ export default function App() {
         lastRequestedFrameRef.current = frameKey;
         setStreamFrameUrl(`${getVideoTruckRunFrameUrl(jobId)}?frame=${latestFrame}&ts=${Date.now()}`);
       }
-      if (status.ocr_log && status.ocr_log.length > 0) {
-        setOcrLog((prev) => {
-          const combined = [...prev, ...status.ocr_log];
-          return combined.slice(-50);
-        });
-      }
+      // Backend returns the full accumulated log each poll — REPLACE, don't append.
+      if (status.ocr_log) setOcrLog(status.ocr_log.slice(-1000));
 
       if (status.json_snapshot) {
         try {
@@ -557,16 +695,33 @@ export default function App() {
       if (status.state === "failed") {
         throw new Error(status.message || "Video processing failed.");
       }
+
+      const logLen = status.ocr_log?.length ?? 0;
+      const prog = status.progress ?? 0;
+      if (latestFrame > bestFrame || prog > bestProgress || logLen > bestLogLen) {
+        bestFrame = Math.max(bestFrame, latestFrame);
+        bestProgress = Math.max(bestProgress, prog);
+        bestLogLen = Math.max(bestLogLen, logLen);
+        pollsSinceProgress = 0;
+      } else if (++pollsSinceProgress >= stallPolls) {
+        throw new Error("Video processing stalled — no progress for several minutes.");
+      }
       await sleep(2000);
     }
-    throw new Error("Video processing timed out while waiting for completion.");
   }
 
   async function pollMultiCameraUntilComplete(jobId) {
-    const maxPolls = 900;
-    const maxRetries = 5;
+    const maxRetries = 8;
+    // Run to completion as long as work keeps advancing. Only give up if there is
+    // NO progress (no frame advance, no new logs, no higher %) for this many
+    // consecutive polls — ~10 min at 2s — a genuine stall, not just a slow job.
+    const stallPolls = 300;
     let retries = 0;
-    for (let i = 0; i < maxPolls; i += 1) {
+    let bestProgress = -1;
+    let bestFrameSum = -1;
+    let bestLogLen = -1;
+    let pollsSinceProgress = 0;
+    for (let i = 0; ; i += 1) {
       let status;
       try {
         status = await getMultiCameraStatus(jobId);
@@ -576,10 +731,12 @@ export default function App() {
         throw new Error("Multi-camera backend unreachable after retries.");
       }
       retries = 0;
-      const progress = status.progress != null ? `${Math.round(status.progress * 100)}%` : "0%";
-      setMessage(`Multi-camera ${jobId.slice(0, 8)} | ${status.state} | ${progress}`);
+      const progressPct = status.progress != null ? Math.round(status.progress * 100) : 0;
+      setMessage(`Multi-camera ${jobId.slice(0, 8)} | ${status.state} | ${progressPct}%`);
+      let frameSum = 0;
       for (const camStatus of (status.cameras || [])) {
         const latestFrame = camStatus.latest_frame_id ?? camStatus.frame_id ?? 0;
+        frameSum += latestFrame;
         if (latestFrame > 0) {
           const frameKey = `${camStatus.camera}:${latestFrame}`;
           if (frameKey !== lastRequestedFrameRef.current) {
@@ -590,12 +747,8 @@ export default function App() {
           }
         }
       }
-      if (status.ocr_log && status.ocr_log.length > 0) {
-        setOcrLog((prev) => {
-          const combined = [...prev, ...status.ocr_log];
-          return combined.slice(-50);
-        });
-      }
+      // Backend returns the full accumulated log each poll — REPLACE, don't append.
+      if (status.ocr_log) setOcrLog(status.ocr_log.slice(-1000));
       if (status.json_snapshot) {
         try {
           const snap = JSON.parse(status.json_snapshot);
@@ -608,9 +761,19 @@ export default function App() {
       }
       if (status.state === "completed") return;
       if (status.state === "failed") throw new Error(status.message || "Multi-camera processing failed.");
+
+      const logLen = status.ocr_log?.length ?? 0;
+      const prog = status.progress ?? 0;
+      if (prog > bestProgress || frameSum > bestFrameSum || logLen > bestLogLen) {
+        bestProgress = Math.max(bestProgress, prog);
+        bestFrameSum = Math.max(bestFrameSum, frameSum);
+        bestLogLen = Math.max(bestLogLen, logLen);
+        pollsSinceProgress = 0;
+      } else if (++pollsSinceProgress >= stallPolls) {
+        throw new Error("Multi-camera processing stalled — no progress for several minutes.");
+      }
       await sleep(2000);
     }
-    throw new Error("Multi-camera processing timed out.");
   }
 
   async function handleVideoUpload() {
@@ -803,160 +966,63 @@ export default function App() {
 
           {message && <div className="message-banner">{message}</div>}
 
-          <div className="content-grid">
-            <div className="form-pane">
-              <div className="form-block">
-                <h3>TRUCKER INFORMATION</h3>
-                <p>POPULATED FROM MODEL CLASS FIELDS
-                  {currentFields.camera ? <span className="cam-source-chip" style={{marginLeft: 8}}>{currentFields.camera.toUpperCase()}</span> : null}
-                </p>
-                <div className="field-row">
-                  <div className="field-wrap">
-                    <span className="field-name">
-                      truck_company
-                      {currentFields.fieldCameras?.truck_company && <span className={`field-cam-tag cam-${currentFields.fieldCameras.truck_company}`}>{currentFields.fieldCameras.truck_company.toUpperCase()}</span>}
-                    </span>
-                    <input value={currentFields.truck_company} placeholder="truck_company" readOnly className={currentFields.fieldCameras?.truck_company ? `cam-border-${currentFields.fieldCameras.truck_company}` : ""} />
-                  </div>
-                  <button type="button" disabled>
-                    DETECTED
-                  </button>
-                  <div className="field-wrap">
-                    <span className="field-name">
-                      driver
-                      {currentFields.fieldCameras?.driver && <span className={`field-cam-tag cam-${currentFields.fieldCameras.driver}`}>{currentFields.fieldCameras.driver.toUpperCase()}</span>}
-                    </span>
-                    <input value={currentFields.driver} placeholder="driver" readOnly className={currentFields.fieldCameras?.driver ? `cam-border-${currentFields.fieldCameras.driver}` : ""} />
-                  </div>
-                </div>
-                <div className="field-row two with-gap">
-                  <div className="field-wrap">
-                    <span className="field-name">
-                      license_plate
-                      {currentFields.fieldCameras?.license_plate && <span className={`field-cam-tag cam-${currentFields.fieldCameras.license_plate}`}>{currentFields.fieldCameras.license_plate.toUpperCase()}</span>}
-                    </span>
-                    <input value={currentFields.license_plate} placeholder="license_plate" readOnly className={currentFields.fieldCameras?.license_plate ? `cam-border-${currentFields.fieldCameras.license_plate}` : ""} />
-                  </div>
-                  <div className="field-wrap">
-                    <span className="field-name">
-                      truck_number
-                      {currentFields.fieldCameras?.truck_number && <span className={`field-cam-tag cam-${currentFields.fieldCameras.truck_number}`}>{currentFields.fieldCameras.truck_number.toUpperCase()}</span>}
-                    </span>
-                    <input value={currentFields.truck_number} placeholder="truck_number" readOnly className={currentFields.fieldCameras?.truck_number ? `cam-border-${currentFields.fieldCameras.truck_number}` : ""} />
-                  </div>
-                </div>
-              </div>
-
-              <div className="form-block">
-                <h3>EQUIPMENT INFORMATION</h3>
-                <p>AUTO-FILLED DETECTION FIELDS (MODEL CLASSES)</p>
-                <div className="field-row two">
-                  <div className="pair">
-                    <div className="field-wrap">
-                      <span className="field-name">
-                        container_number
-                        {currentFields.fieldCameras?.container_number && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_number}`}>{currentFields.fieldCameras.container_number.toUpperCase()}</span>}
-                      </span>
-                      <input value={currentFields.container_number} placeholder="container_number" readOnly className={currentFields.fieldCameras?.container_number ? `cam-border-${currentFields.fieldCameras.container_number}` : ""} />
-                    </div>
-                    <div className="field-wrap">
-                      <span className="field-name">
-                        container_side_no
-                        {currentFields.fieldCameras?.container_side_no && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_side_no}`}>{currentFields.fieldCameras.container_side_no.toUpperCase()}</span>}
-                      </span>
-                      <input value={currentFields.container_side_no} placeholder="container_side_no" readOnly className={currentFields.fieldCameras?.container_side_no ? `cam-border-${currentFields.fieldCameras.container_side_no}` : ""} />
-                    </div>
-                  </div>
-                  <div className="pair">
-                    <div className="field-wrap">
-                      <span className="field-name">
-                        container_company_logo
-                        {currentFields.fieldCameras?.container_company_logo && <span className={`field-cam-tag cam-${currentFields.fieldCameras.container_company_logo}`}>{currentFields.fieldCameras.container_company_logo.toUpperCase()}</span>}
-                      </span>
-                      <input value={currentFields.container_company_logo} placeholder="container_company_logo" readOnly className={currentFields.fieldCameras?.container_company_logo ? `cam-border-${currentFields.fieldCameras.container_company_logo}` : ""} />
-                    </div>
-                    <div className="field-wrap">
-                      <span className="field-name">
-                        other_container_info
-                        {currentFields.fieldCameras?.other_container_info && <span className={`field-cam-tag cam-${currentFields.fieldCameras.other_container_info}`}>{currentFields.fieldCameras.other_container_info.toUpperCase()}</span>}
-                      </span>
-                      <input value={currentFields.other_container_info} placeholder="other_container_info" readOnly className={currentFields.fieldCameras?.other_container_info ? `cam-border-${currentFields.fieldCameras.other_container_info}` : ""} />
-                    </div>
-                  </div>
-                </div>
-                <div className="field-row three with-gap">
-                  <div className="field-wrap">
-                    <span className="field-name">track_id</span>
-                    <input value={currentFields.trackId} placeholder="track_id" readOnly />
-                  </div>
-                  <div className="field-wrap">
-                    <span className="field-name">truck_class</span>
-                    <input value={currentFields.truckClass} placeholder="truck_class" readOnly />
-                  </div>
-                  <div className="field-wrap">
-                    <span className="field-name">confidence_avg</span>
-                    <input value={currentFields.confidence} placeholder="confidence_avg" readOnly />
-                  </div>
-                </div>
-                <div className="field-row two with-gap">
-                  <div className="field-wrap">
-                    <span className="field-name">duration_sec</span>
-                    <input value={currentFields.durationSec} placeholder="duration_sec" readOnly />
-                  </div>
-                  <div className="field-wrap">
-                    <span className="field-name">last_bbox</span>
-                    <input value={currentFields.bbox} placeholder="last_bbox" readOnly />
-                  </div>
-                </div>
-              </div>
-
-              <div className="approval-row">
-                <button
-                  type="button"
-                  className="approve-btn"
-                  onClick={handleApprove}
-                  disabled={!currentTruck || currentTruck.review_status === "rejected"}
-                >
-                  Approve
-                </button>
-                <button
-                  type="button"
-                  className="reject-btn"
-                  onClick={handleReject}
-                  disabled={!currentTruck || currentTruck.review_status === "rejected"}
-                >
-                  Reject
-                </button>
-              </div>
-            </div>
-
-            <aside className="stream-pane">
+          <section className="video-stage">
+            <div className="video-main">
               <div className="stream-head">
-                <span>DEMO STREAM</span>
+                <span className="stream-title">LIVE MULTI-CAM STREAM</span>
+                <span
+                  className={`ocr-status ocr-${ocrBadge.cls}`}
+                  title={ocrStatus?.last_error || `${ocrStatus?.provider || "MinerU"} OCR`}
+                >
+                  <span className="ocr-dot" />
+                  {ocrBadge.label}
+                </span>
               </div>
-              <div className="stream-view">
+              <div className="stream-view stream-view-large">
                 {selectedCameraCount >= 1 && Object.values(camStreamUrls).some(Boolean) ? (
-                  <div className="multi-cam-grid">
-                    {["front", "right", "back", "left"].map((cam) =>
-                      camFiles[cam] ? (
-                        <div key={cam} className="multi-cam-cell">
-                          <span className="cam-label-badge">{cam.toUpperCase()}</span>
-                          {camStreamUrls[cam] ? (
-                            <img
-                              src={camStreamUrls[cam]}
-                              alt={`${cam} stream`}
-                              className="stream-image"
-                              style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
-                              onError={() => { streamFrameLoadingRef.current = false; }}
-                              onLoad={() => { streamFrameLoadingRef.current = false; }}
-                            />
-                          ) : (
-                            <div className="stream-empty cam-waiting">Waiting for {cam}…</div>
-                          )}
-                        </div>
-                      ) : null
-                    )}
-                  </div>
+                  expandedCam && camFiles[expandedCam] ? (
+                    <div className="cam-expanded">
+                      <button type="button" className="cam-back-btn" onClick={() => setExpandedCam(null)}>
+                        ← All cameras
+                      </button>
+                      <span className="cam-label-badge">{expandedCam.toUpperCase()}</span>
+                      {camStreamUrls[expandedCam] ? (
+                        <img
+                          src={camStreamUrls[expandedCam]}
+                          alt={`${expandedCam} stream`}
+                          className="stream-image"
+                          style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
+                          onError={() => { streamFrameLoadingRef.current = false; }}
+                          onLoad={() => { streamFrameLoadingRef.current = false; }}
+                        />
+                      ) : (
+                        <div className="stream-empty cam-waiting">Waiting for {expandedCam}…</div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="multi-cam-grid">
+                      {["front", "right", "back", "left"].map((cam) =>
+                        camFiles[cam] ? (
+                          <div key={cam} className="multi-cam-cell" onClick={() => setExpandedCam(cam)} title={`Expand ${cam}`}>
+                            <span className="cam-label-badge">{cam.toUpperCase()}</span>
+                            <span className="cam-expand-hint">⤢</span>
+                            {camStreamUrls[cam] ? (
+                              <img
+                                src={camStreamUrls[cam]}
+                                alt={`${cam} stream`}
+                                className="stream-image"
+                                style={{ transform: `scale(${videoZoom})`, transformOrigin: "center center" }}
+                                onError={() => { streamFrameLoadingRef.current = false; }}
+                                onLoad={() => { streamFrameLoadingRef.current = false; }}
+                              />
+                            ) : (
+                              <div className="stream-empty cam-waiting">Waiting for {cam}…</div>
+                            )}
+                          </div>
+                        ) : null
+                      )}
+                    </div>
+                  )
                 ) : activeJobId && streamFrameUrl ? (
                   <img
                     src={streamFrameUrl}
@@ -982,7 +1048,7 @@ export default function App() {
                 ) : hasSelectedVideo ? (
                   <div className="stream-empty">Video selected. Click Detect to process frames.</div>
                 ) : (
-                  <div className="stream-empty">Upload a video to process frames.</div>
+                  <div className="stream-empty">Upload one or more camera videos to begin.</div>
                 )}
               </div>
               <div className="stream-controls">
@@ -994,6 +1060,10 @@ export default function App() {
                 <button type="button" className="zoom-btn" onClick={() => setVideoZoom(1)} title="Reset zoom">⟲</button>
                 <span className="zoom-label">{Math.round(videoZoom * 100)}%</span>
               </div>
+              {streamWarning && <div className="stream-warning">{streamWarning}</div>}
+            </div>
+            <aside className="video-rail">
+              <div className="rail-title">CONTROLS</div>
               <div className={`process-status status-${processStatus}`}>
                 <span className="status-dot" />
                 <span className="status-label">
@@ -1041,11 +1111,42 @@ export default function App() {
               <div className="multi-upload-note">
                 Upload 1–4 camera angles (front / right / back / left) of the same vehicle. All streams run in parallel — OCR fires immediately on each detection.
               </div>
+
+              <div className="token-box">
+                <div className="rail-subtitle">MinerU API token</div>
+                <input
+                  type="password"
+                  className="token-input"
+                  placeholder={ocrStatus?.token_configured ? "Token set — paste to replace" : "Paste MinerU token"}
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveToken(); }}
+                />
+                <button
+                  type="button"
+                  className="token-save-btn"
+                  onClick={saveToken}
+                  disabled={tokenSaving || !tokenInput.trim()}
+                >
+                  {tokenSaving ? "Saving…" : "Save token"}
+                </button>
+                {tokenMsg && <div className="token-msg">{tokenMsg}</div>}
+              </div>
+
               {ocrLog.length > 0 && (
                 <div className="ocr-log-panel">
-                  <div className="ocr-log-head">LIVE OCR LOG</div>
-                  <div className="ocr-log-scroll">
-                    {ocrLog.slice(-10).map((line, idx) => (
+                  <div className="ocr-log-head">
+                    <span>OCR LOG · {ocrLog.length}</span>
+                    <button
+                      type="button"
+                      className="log-toggle-btn"
+                      onClick={() => setShowAllLogs((v) => !v)}
+                    >
+                      {showAllLogs ? "Show recent" : "Show full log"}
+                    </button>
+                  </div>
+                  <div className={showAllLogs ? "ocr-log-scroll ocr-log-scroll-full" : "ocr-log-scroll"}>
+                    {(showAllLogs ? ocrLog : ocrLog.slice(-12)).map((line, idx) => (
                       <div key={idx} className={`ocr-log-line ${line.includes('LOCKED') ? 'log-locked' : line.includes('VOTE') ? 'log-vote' : line.includes('BEST') ? 'log-best' : line.includes('orphan') ? 'log-orphan' : ''}`}>
                         {line}
                       </div>
@@ -1054,7 +1155,7 @@ export default function App() {
                 </div>
               )}
             </aside>
-          </div>
+          </section>
 
           <section className="dashboard-table">
             <div className="dashboard-head">
@@ -1174,14 +1275,14 @@ export default function App() {
                             </td>
                           )}
                           <td><span className="cell-truncate" title={fields.truckClass}>{shortText(fields.truckClass, 24)}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 20)}{fields.fieldCameras?.container_company_logo && <span className={`field-cam-tag cam-${fields.fieldCameras.container_company_logo}`}>{fields.fieldCameras.container_company_logo[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_number}>{shortText(fields.container_number, 20)}{fields.fieldCameras?.container_number && <span className={`field-cam-tag cam-${fields.fieldCameras.container_number}`}>{fields.fieldCameras.container_number[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.container_side_no}>{shortText(fields.container_side_no, 20)}{fields.fieldCameras?.container_side_no && <span className={`field-cam-tag cam-${fields.fieldCameras.container_side_no}`}>{fields.fieldCameras.container_side_no[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.driver}>{shortText(fields.driver, 20)}{fields.fieldCameras?.driver && <span className={`field-cam-tag cam-${fields.fieldCameras.driver}`}>{fields.fieldCameras.driver[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.license_plate}>{shortText(fields.license_plate, 20)}{fields.fieldCameras?.license_plate && <span className={`field-cam-tag cam-${fields.fieldCameras.license_plate}`}>{fields.fieldCameras.license_plate[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.other_container_info}>{shortText(fields.other_container_info, 20)}{fields.fieldCameras?.other_container_info && <span className={`field-cam-tag cam-${fields.fieldCameras.other_container_info}`}>{fields.fieldCameras.other_container_info[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.truck_company}>{shortText(fields.truck_company, 20)}{fields.fieldCameras?.truck_company && <span className={`field-cam-tag cam-${fields.fieldCameras.truck_company}`}>{fields.fieldCameras.truck_company[0].toUpperCase()}</span>}</span></td>
-                          <td><span className="cell-truncate" title={fields.truck_number}>{shortText(fields.truck_number, 20)}{fields.fieldCameras?.truck_number && <span className={`field-cam-tag cam-${fields.fieldCameras.truck_number}`}>{fields.fieldCameras.truck_number[0].toUpperCase()}</span>}</span></td>
+                          {ocrTd(truck, fields, "container_company_logo")}
+                          {ocrTd(truck, fields, "container_number")}
+                          {ocrTd(truck, fields, "container_side_no")}
+                          {ocrTd(truck, fields, "driver")}
+                          {ocrTd(truck, fields, "license_plate")}
+                          {ocrTd(truck, fields, "other_container_info")}
+                          {ocrTd(truck, fields, "truck_company")}
+                          {ocrTd(truck, fields, "truck_number")}
                           <td>{fields.ocr_confidence}</td>
                           <td>{fields.confidence}</td>
                           <td>{fields.durationSec}</td>
@@ -1278,31 +1379,31 @@ export default function App() {
                           {fields.license_plate !== "—" && (
                             <div className="gate-field">
                               <span className="gate-field-label">License Plate</span>
-                              <span className="gate-field-value strong">{fields.license_plate}</span>
+                              {clipValue(truck, "license_plate", fields.license_plate, "strong")}
                             </div>
                           )}
                           {fields.container_number !== "—" && (
                             <div className="gate-field">
                               <span className="gate-field-label">Container No.</span>
-                              <span className="gate-field-value strong">{fields.container_number}</span>
+                              {clipValue(truck, "container_number", fields.container_number, "strong")}
                             </div>
                           )}
                           {fields.container_side_no !== "—" && (
                             <div className="gate-field">
                               <span className="gate-field-label">Side No.</span>
-                              <span className="gate-field-value">{fields.container_side_no}</span>
+                              {clipValue(truck, "container_side_no", fields.container_side_no)}
                             </div>
                           )}
                           {fields.truck_number !== "—" && (
                             <div className="gate-field">
                               <span className="gate-field-label">Truck No.</span>
-                              <span className="gate-field-value">{fields.truck_number}</span>
+                              {clipValue(truck, "truck_number", fields.truck_number)}
                             </div>
                           )}
                           {fields.truck_company !== "—" && (
                             <div className="gate-field">
                               <span className="gate-field-label">Company</span>
-                              <span className="gate-field-value">{fields.truck_company}</span>
+                              {clipValue(truck, "truck_company", fields.truck_company)}
                             </div>
                           )}
                           <div className="gate-field">
@@ -1372,6 +1473,67 @@ export default function App() {
           </section>
         </section>
       </main>
+
+      {fieldReplay?.open && (
+        <>
+          <div className="replay-scrim" onClick={() => setFieldReplay(null)} />
+          <aside className="replay-drawer" role="dialog" aria-label="Field capture replay">
+            <div className="replay-head">
+              <div className="replay-title">
+                <span className="replay-eyebrow">FIELD CAPTURE</span>
+                <h3>{fieldReplay.label}</h3>
+              </div>
+              <button type="button" className="replay-close" onClick={() => setFieldReplay(null)} aria-label="Close">✕</button>
+            </div>
+
+            {fieldReplay.value && fieldReplay.value !== "—" && (
+              <div className="replay-readout">
+                <span className="replay-readout-label">Reading</span>
+                <span className="replay-readout-value">{fieldReplay.value}</span>
+              </div>
+            )}
+
+            <div className="replay-stage">
+              {fieldReplay.loading ? (
+                <div className="replay-empty">Loading capture…</div>
+              ) : fieldReplay.error ? (
+                <div className="replay-empty replay-error">{fieldReplay.error}</div>
+              ) : fieldReplay.frames.length > 0 ? (
+                <img
+                  className="replay-frame"
+                  src={fieldReplay.frames[fieldReplay.idx]}
+                  alt={`${fieldReplay.label} frame ${fieldReplay.idx + 1}`}
+                />
+              ) : (
+                <div className="replay-empty">No frames captured.</div>
+              )}
+            </div>
+
+            {fieldReplay.frames.length > 0 && !fieldReplay.loading && (
+              <div className="replay-controls">
+                <button
+                  type="button"
+                  className="replay-play"
+                  onClick={() => setFieldReplay((p) => ({ ...p, playing: !p.playing }))}
+                  disabled={fieldReplay.frames.length < 2}
+                >
+                  {fieldReplay.playing ? "⏸" : "▶"}
+                </button>
+                <input
+                  type="range"
+                  className="replay-scrub"
+                  min={0}
+                  max={fieldReplay.frames.length - 1}
+                  value={fieldReplay.idx}
+                  onChange={(e) => setFieldReplay((p) => ({ ...p, idx: Number(e.target.value), playing: false }))}
+                />
+                <span className="replay-counter">{fieldReplay.idx + 1}/{fieldReplay.frames.length}</span>
+              </div>
+            )}
+            <p className="replay-hint">Frames captured each time this field was read by OCR.</p>
+          </aside>
+        </>
+      )}
     </div>
   );
 }

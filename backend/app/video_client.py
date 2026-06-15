@@ -55,7 +55,7 @@ class LocalVideoService:
             "fps": job.fps,
             "message": job.message,
             "error": job.error,
-            "ocr_log": job.ocr_log[-20:],
+            "ocr_log": list(job.ocr_log),
             "json_snapshot": job.json_snapshot,
         }
 

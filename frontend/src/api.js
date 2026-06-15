@@ -1,8 +1,8 @@
 import axios from "axios";
 
 // Default to a same-origin (relative) base so the app works on whatever
-// host/port served it (e.g. the backend on :8001). Override with
-// VITE_API_BASE_URL only when the API lives on a different origin.
+// host/port served it (the dev server proxies /api to the backend on :8000).
+// Override with VITE_API_BASE_URL only when the API lives on a different origin.
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
 export const api = axios.create({
@@ -120,6 +120,24 @@ export async function getMultiCameraStatus(jobId) {
 
 export async function finalizeMultiCamera(jobId) {
   const { data } = await api.post(`/api/truck-runs/multi-camera/${jobId}/finalize`);
+  return data;
+}
+
+export async function getOcrStatus() {
+  const { data } = await api.get("/api/ocr/status", { timeout: 8000 });
+  return data;
+}
+
+export async function setOcrToken(token) {
+  const { data } = await api.post("/api/ocr/token", { token }, { timeout: 8000 });
+  return data;
+}
+
+export async function fetchFieldMedia(jobId, trackId, field) {
+  const { data } = await api.get(
+    `/api/field-media/${encodeURIComponent(jobId)}/${encodeURIComponent(trackId)}/${encodeURIComponent(field)}`,
+    { timeout: 15000 }
+  );
   return data;
 }
 
