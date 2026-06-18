@@ -95,13 +95,33 @@ if SAVE_CROPS:
 # ========================= APP + MODEL =======================================
 app = FastAPI(title="PlateFlow Colab GPU API", version="3.5.0")
 
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+def _select_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+DEVICE   = _select_device()
 USE_HALF = USE_HALF if DEVICE == "cuda" else False
+print("=" * 72, flush=True)
+print(f"[PlateFlow] Loading model: {MODEL_PATH}", flush=True)
+print(f"[PlateFlow] Torch version: {torch.__version__}", flush=True)
+if DEVICE == "cuda":
+    print(f"[PlateFlow] GPU enabled: CUDA ({torch.cuda.get_device_name(0)})", flush=True)
+elif DEVICE == "mps":
+    print("[PlateFlow] GPU enabled: Apple Metal/MPS", flush=True)
+else:
+    print("[PlateFlow] GPU not available: running on CPU", flush=True)
+print(f"[PlateFlow] Inference device: {DEVICE} | half precision: {USE_HALF}", flush=True)
 model    = YOLO(MODEL_PATH)
 model.to(DEVICE)
 _dummy = np.zeros((640, 640, 3), dtype=np.uint8)
 model.predict(_dummy, verbose=False, half=USE_HALF, device=DEVICE)
 del _dummy
+print("[PlateFlow] Model loaded and warmup inference completed.", flush=True)
+print("=" * 72, flush=True)
 
 # ========================= DATA STRUCTS ======================================
 _jobs_lock = threading.Lock()
@@ -307,6 +327,12 @@ def _text_quality(text: str) -> float:
     return good / len(text)
 
 
+def _extract_mineru_image(md_text: str) -> str | None:
+    """Extract the image path from Mineru markdown output."""
+    m = re.search(r"!\[\]\(([^)]+)\)", md_text)
+    return m.group(1) if m else None
+
+
 # ========================= TRUCK REGISTRY ====================================
 class TruckRegistry:
     _WITH_CONTAINER_TEMPLATE = {
@@ -378,7 +404,15 @@ class TruckRegistry:
             rec["confidence_avg"] = round((rec["confidence_avg"] * n + conf) / (n + 1), 4)
             rec["_conf_n"] = n + 1
 
-    def attach_ocr(self, truck_track_id: int, truck_type: str, field: str, text: str) -> None:
+    def attach_ocr(
+        self,
+        truck_track_id: int,
+        truck_type: str,
+        field: str,
+        text: str,
+        conf: float = 0.0,
+        image: str | None = None,
+    ) -> None:
         if not text:
             return
         with self._lock:
@@ -388,16 +422,31 @@ class TruckRegistry:
             info = rec["associated_info"]
             if field not in info:
                 return
-            existing = info.get(field) or ""
-            if not existing:
-                info[field] = text
+            existing = info.get(field)
+            # Handle both old string format and new structured dict
+            if existing is None or existing == "":
+                info[field] = {"text": text, "confidence": round(conf, 4)}
+                if image:
+                    info[field]["image"] = image
                 return
-            new_q = _text_quality(text)
-            old_q = _text_quality(existing)
-            if new_q > old_q:
-                info[field] = text
-            elif new_q == old_q and len(text) < len(existing):
-                info[field] = text
+            if isinstance(existing, dict):
+                existing_text = existing.get("text", "")
+                existing_conf = existing.get("confidence", 0.0)
+            else:
+                existing_text = existing
+                existing_conf = 0.0
+            # Prefer higher confidence; tiebreak with text quality
+            if conf > existing_conf:
+                info[field] = {"text": text, "confidence": round(conf, 4)}
+                if image:
+                    info[field]["image"] = image
+            elif conf == existing_conf:
+                new_q = _text_quality(text)
+                old_q = _text_quality(existing_text)
+                if new_q > old_q or (new_q == old_q and len(text) < len(existing_text)):
+                    info[field] = {"text": text, "confidence": round(conf, 4)}
+                    if image:
+                        info[field]["image"] = image
 
     def field_is_empty(self, truck_track_id: int, field: str) -> bool:
         """Return True if the truck exists and the field hasn't been filled yet."""
@@ -405,7 +454,12 @@ class TruckRegistry:
             rec = self.trucks.get(truck_track_id)
             if rec is None:
                 return False
-            return not rec["associated_info"].get(field)
+            val = rec["associated_info"].get(field)
+            if val is None:
+                return True
+            if isinstance(val, dict):
+                return not val.get("text")
+            return not val
 
     def find_truck_for_field(self, field: str) -> int | None:
         with self._lock:
@@ -415,11 +469,15 @@ class TruckRegistry:
                 info = rec["associated_info"]
                 if field not in info:
                     continue
-                existing = info.get(field) or ""
-                last_f   = rec.get("last_seen_frame", 0)
-                if not existing and last_f > best_frame:
+                existing = info.get(field)
+                if isinstance(existing, dict):
+                    existing_text = existing.get("text", "") or ""
+                else:
+                    existing_text = existing or ""
+                last_f = rec.get("last_seen_frame", 0)
+                if not existing_text and last_f > best_frame:
                     best_frame = last_f
-                    best_tid   = tid
+                    best_tid = tid
             if best_tid is None:
                 for tid, rec in self.trucks.items():
                     info   = rec["associated_info"]
@@ -670,6 +728,7 @@ def _enqueue_ocr(
     truck_tid: int | None,
     truck_type: str | None,
     child_track_id: int | None = None,
+    conf: float = 0.0,
 ) -> None:
     with _jobs_lock:
         job = JOBS.get(job_id)
@@ -677,7 +736,7 @@ def _enqueue_ocr(
             return
         job.submitted_keys.add(key)
         job.pending_keys.add(key)
-    _ocr_queue.put((job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id))
+    _ocr_queue.put((job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id, conf))
 
 
 def _ocr_worker() -> None:
@@ -685,7 +744,7 @@ def _ocr_worker() -> None:
         item = _ocr_queue.get()
         if item is None:
             break
-        job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id = item
+        job_id, key, crop_rgb, field, frame_id, truck_tid, truck_type, child_track_id, conf = item
         
         with _jobs_lock:
             job = JOBS.get(job_id)
@@ -702,7 +761,9 @@ def _ocr_worker() -> None:
                 print(f"  [OCR] using LOCKED association: child T#{child_track_id} → T#{truck_tid}")
         
         # Perform OCR outside lock
-        text = _call_mineru_ocr(crop_rgb)
+        md_text = _call_mineru_ocr(crop_rgb)
+        plain_text = _parse_mineru_markdown(md_text) if md_text else None
+        image_path = _extract_mineru_image(md_text) if md_text else None
         
         with _jobs_lock:
             job = JOBS.get(job_id)
@@ -711,16 +772,16 @@ def _ocr_worker() -> None:
                 continue
             
             job.pending_keys.discard(key)
-            if text:
-                job.ocr_cache[key] = text
-                log = f"[f{frame_id}] {field} → '{text}'"
+            if plain_text:
+                job.ocr_cache[key] = plain_text
+                log = f"[f{frame_id}] {field} → '{plain_text}'"
 
                 resolved_tid = truck_tid
                 resolved_type = truck_type or ""
 
                 if job.registry is not None:
                     if resolved_tid is not None:
-                        job.registry.attach_ocr(resolved_tid, resolved_type, field, text)
+                        job.registry.attach_ocr(resolved_tid, resolved_type, field, plain_text, conf, image_path)
                         log += f"  (T#{resolved_tid})"
                     else:
                         candidate = job.registry.find_truck_for_field(field)
@@ -728,7 +789,7 @@ def _ocr_worker() -> None:
                             resolved_tid = candidate
                             rec = job.registry.trucks.get(candidate)
                             resolved_type = rec["type"] if rec else ""
-                            job.registry.attach_ocr(resolved_tid, resolved_type, field, text)
+                            job.registry.attach_ocr(resolved_tid, resolved_type, field, plain_text, conf, image_path)
                             log += f"  (orphan → T#{resolved_tid})"
                             print(f"  [OCR] ↩ orphan '{field}' rescued → T#{resolved_tid}")
                         else:
@@ -737,7 +798,7 @@ def _ocr_worker() -> None:
                 
                 job.ocr_log.append(log)
                 job.ocr_log = job.ocr_log[-60:]
-                print(f"  [OCR] ✓ {key} → '{text}'")
+                print(f"  [OCR] ✓ {key} → '{plain_text}'")
             else:
                 # Empty result — remove from submitted so retry is possible
                 job.submitted_keys.discard(key)
@@ -912,21 +973,21 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             if key in cached:
                 ocr_map[i] = cached[key]
 
-            # Best-confidence tracking: only queue if confidence improved
+            # Best-confidence tracking: always use the highest-confidence crop per (cls, track_id).
+            # We check even when the key is already submitted so a better crop supersedes the old one.
             should_submit = False
-            if key not in pending and key not in submitted and job is not None:
+            if job is not None:
                 best_key = (cls_name, track_id) if track_id is not None else None
                 if best_key:
                     with _jobs_lock:
                         prev_best = job.ocr_best_conf.get(best_key, 0.0)
                         if conf_val > prev_best:
                             job.ocr_best_conf[best_key] = conf_val
-                            # Remove old pending/submitted for this key
                             job.submitted_keys.discard(key)
                             job.pending_keys.discard(key)
                             should_submit = True
                             print(f"  [OCR-BEST] {cls_name} T#{track_id} conf={conf_val:.3f} > prev={prev_best:.3f}")
-                else:
+                elif key not in pending and key not in submitted:
                     should_submit = True
 
             if should_submit and job is not None:
@@ -935,6 +996,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     _preprocess_crop(crop_bgr),
                     field, frame_id, truck_tid, truck_type,
                     track_id,  # Pass child track_id for lock lookup
+                    conf=conf_val,
                 )
 
         # ── pending_track_ids for "scanning…" overlay ─────────────────────────

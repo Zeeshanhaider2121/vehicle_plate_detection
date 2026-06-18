@@ -29,6 +29,11 @@ function mergeInfo(existing, incoming) {
       result[key] = inc;
       continue;
     }
+    // Prefer higher-confidence OCR result when both are structured objects
+    if (typeof inc === "object" && typeof ext === "object" && inc.confidence != null && ext.confidence != null) {
+      if (inc.confidence > ext.confidence) result[key] = inc;
+      continue;
+    }
     if (isBlurry(inc) && !isBlurry(ext)) continue;
     if (!isBlurry(inc) && isBlurry(ext)) { result[key] = inc; continue; }
     if (String(inc).length < String(ext).length) result[key] = inc;
@@ -48,23 +53,50 @@ const menuItems = [
   "Pre-Arrive Admin"
 ];
 
+function readOcrFieldValue(value) {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value.text) return value.text;
+  return "—";
+}
+
+function readOcrFieldConfidence(value) {
+  if (value !== null && typeof value === "object" && value.confidence != null) return value.confidence;
+  return null;
+}
+
 function readTruckFields(truck) {
   const info = truck?.associated_info || {};
   const pickFirst = (...values) =>
     values.find((value) => value !== null && value !== undefined && String(value).trim() !== "") || "—";
 
+  const ocrFields = [
+    "container_company_logo", "container_number", "container_side_no",
+    "driver", "license_plate", "other_container_info",
+    "truck_company", "truck_number"
+  ];
+  const fieldTexts = {};
+  const fieldConfs = {};
+  for (const f of ocrFields) {
+    fieldTexts[f] = readOcrFieldValue(info[f]);
+    const c = readOcrFieldConfidence(info[f]);
+    fieldConfs[f] = c != null ? c.toFixed(3) : "—";
+  }
+  // Show max OCR confidence across filled fields — reflects the best crop selected per class
+  const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
+  const maxOcrConf = ocrConfs.length > 0 ? Math.max(...ocrConfs).toFixed(3) : "—";
+
   return {
     trackId: pickFirst(truck?.track_id),
     truckClass: pickFirst(truck?.truck_type, truck?.type),
-    container_company_logo: pickFirst(info.container_company_logo),
-    container_number: pickFirst(info.container_number),
-    container_side_no: pickFirst(info.container_side_no),
-    driver: pickFirst(info.driver),
-    license_plate: pickFirst(info.license_plate),
-    other_container_info: pickFirst(info.other_container_info),
-    truck_company: pickFirst(info.truck_company),
-    truck_number: pickFirst(info.truck_number),
+    ...fieldTexts,
+    ...Object.fromEntries(Object.entries(fieldConfs).map(([k, v]) => [k + "_conf", v])),
+    driver: fieldTexts.driver,
+    license_plate: fieldTexts.license_plate,
+    truck_company: fieldTexts.truck_company,
+    truck_number: fieldTexts.truck_number,
     confidence: pickFirst(truck?.confidence_avg),
+    ocr_confidence: maxOcrConf,
     durationSec: pickFirst(truck?.duration_sec),
     firstSeen: pickFirst(truck?.first_seen_time_sec),
     lastSeen: pickFirst(truck?.last_seen_time_sec),
@@ -78,6 +110,15 @@ function shortText(value, max = 22) {
   const text = String(value ?? "");
   if (text.length <= max) return text;
   return `${text.slice(0, Math.max(0, max - 3))}...`;
+}
+
+function formatTimeSec(sec) {
+  if (sec === null || sec === undefined || sec === "—") return "—";
+  const s = Number(sec);
+  if (isNaN(s)) return "—";
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60).toString().padStart(2, "0");
+  return `${m}:${ss}`;
 }
 
 function stripOcrMarkdown(value) {
@@ -147,6 +188,7 @@ export default function App() {
   const [processStatus, setProcessStatus] = useState("idle");
   const [videoPlaying, setVideoPlaying] = useState(true);
   const [ocrLog, setOcrLog] = useState([]);
+  const [groupByField, setGroupByField] = useState(false);
   const videoRef = useRef(null);
 
   function toggleVideo() {
@@ -168,16 +210,83 @@ export default function App() {
   const currentFields = useMemo(() => readTruckFields(currentTruck), [currentTruck]);
 
   const counts = useMemo(() => {
-    const summary = { detected: detectedTrucks.length, approved: 0, rejected: 0, pending: 0 };
+    const summary = { detected: detectedTrucks.length, approved: 0, rejected: 0, pending: 0, withTrailer: 0, withoutTrailer: 0 };
     for (const truck of detectedTrucks) {
       if (truck.review_status === "approved") summary.approved += 1;
       else if (truck.review_status === "rejected") summary.rejected += 1;
       else summary.pending += 1;
+      const type = (truck.truck_type || truck.type || "").toLowerCase();
+      if (type.includes("with_container") || type.includes("with container")) summary.withTrailer += 1;
+      else summary.withoutTrailer += 1;
     }
     return summary;
   }, [detectedTrucks]);
 
   const pendingCount = counts.pending;
+
+  const displayRows = useMemo(() => {
+    if (!groupByField) return detectedTrucks;
+
+    const groups = new Map();
+    for (const truck of detectedTrucks) {
+      const fields = readTruckFields(truck);
+      const key =
+        (fields.license_plate !== "—" ? fields.license_plate : null) ||
+        (fields.container_number !== "—" ? fields.container_number : null) ||
+        (fields.truck_number !== "—" ? fields.truck_number : null) ||
+        truck.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(truck);
+    }
+
+    return [...groups.values()].map((trucks) => {
+      const best = trucks.reduce((a, b) =>
+        (a.confidence_avg ?? 0) >= (b.confidence_avg ?? 0) ? a : b, trucks[0]);
+      let merged = {};
+      for (const t of trucks) merged = mergeInfo(merged, t.associated_info || {});
+      return {
+        ...best,
+        associated_info: merged,
+        _sourceTracks: trucks.map((t) => `T#${t.track_id}`).join(" + "),
+        _groupCount: trucks.length,
+      };
+    });
+  }, [detectedTrucks, groupByField]);
+
+  const gateRows = useMemo(() => {
+    const groups = new Map();
+    for (const truck of detectedTrucks) {
+      const fields = readTruckFields(truck);
+      const key =
+        (fields.license_plate !== "—" ? fields.license_plate : null) ||
+        (fields.container_number !== "—" ? fields.container_number : null) ||
+        (fields.truck_number !== "—" ? fields.truck_number : null) ||
+        truck.id;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(truck);
+    }
+    return [...groups.values()].map((trucks) => {
+      const best = trucks.reduce((a, b) =>
+        (a.confidence_avg ?? 0) >= (b.confidence_avg ?? 0) ? a : b, trucks[0]);
+      let merged = {};
+      for (const t of trucks) merged = mergeInfo(merged, t.associated_info || {});
+      // Collect camera → track_id from _fusion metadata across all trucks in group
+      const cameraMap = {};
+      for (const t of trucks) {
+        const ft = t.associated_info?._fusion?.source_track_ids;
+        if (ft && Object.keys(ft).length > 0) Object.assign(cameraMap, ft);
+      }
+      if (Object.keys(cameraMap).length === 0) {
+        cameraMap[`T#${best.track_id}`] = best.track_id;
+      }
+      return {
+        ...best,
+        associated_info: { ...merged, _fusion: { ...(merged._fusion || {}), source_track_ids: cameraMap } },
+        _sourceTracks: trucks.map((t) => `T#${t.track_id}`).join(" + "),
+        _groupCount: trucks.length,
+      };
+    });
+  }, [detectedTrucks]);
 
   function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -645,9 +754,26 @@ export default function App() {
                   >
                     List
                   </button>
+                  <button
+                    type="button"
+                    className={dashboardView === "gate" ? "toggle-btn active" : "toggle-btn"}
+                    onClick={() => setDashboardView("gate")}
+                  >
+                    Gate
+                  </button>
+                  <button
+                    type="button"
+                    className={groupByField ? "toggle-btn active" : "toggle-btn"}
+                    onClick={() => setGroupByField((v) => !v)}
+                    title="Group rows that share the same license plate / container number / truck number"
+                  >
+                    Group
+                  </button>
                 </div>
                 <div className="counts">
                   <span>Detected: {counts.detected}</span>
+                  <span className="count-trailer">With Trailer: {counts.withTrailer}</span>
+                  <span className="count-no-trailer">No Trailer: {counts.withoutTrailer}</span>
                   <span>Approved: {counts.approved}</span>
                   <span>Rejected: {counts.rejected}</span>
                 </div>
@@ -660,6 +786,7 @@ export default function App() {
                     <tr>
                       <th>Status</th>
                       <th>Truck ID</th>
+                      {groupByField && <th>Source Tracks</th>}
                       <th>truck_class</th>
                       <th>container_company_logo</th>
                       <th>container_number</th>
@@ -669,6 +796,7 @@ export default function App() {
                       <th>other_container_info</th>
                       <th>truck_company</th>
                       <th>truck_number</th>
+                      <th>ocr_conf</th>
                       <th>confidence_avg</th>
                       <th>duration_sec</th>
                       <th>first_seen_time_sec</th>
@@ -680,22 +808,28 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {detectedTrucks.length === 0 && (
+                    {displayRows.length === 0 && (
                       <tr>
-                        <td colSpan={19} className="empty-cell">
-                          No detected trucks yet.
+                          <td colSpan={groupByField ? 21 : 20} className="empty-cell">
+                            No detected trucks yet.
                         </td>
                       </tr>
                     )}
-                    {detectedTrucks.map((truck) => {
+                    {displayRows.map((truck) => {
                       const fields = readTruckFields(truck);
                       const status = truck.review_status || "pending";
+                      const sourceTracks = truck._sourceTracks || `T#${truck.track_id}`;
                       return (
                         <tr key={truck.id} className={status === "rejected" ? "row-rejected" : ""}>
                           <td>
                             <span className={`status-chip status-${status}`}>{status}</span>
                           </td>
                           <td>{fields.trackId}</td>
+                          {groupByField && (
+                            <td>
+                              <span className="source-tracks-cell" title={sourceTracks}>{sourceTracks}</span>
+                            </td>
+                          )}
                           <td><span className="cell-truncate" title={fields.truckClass}>{shortText(fields.truckClass, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.container_company_logo}>{shortText(fields.container_company_logo, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.container_number}>{shortText(fields.container_number, 24)}</span></td>
@@ -705,6 +839,7 @@ export default function App() {
                           <td><span className="cell-truncate" title={fields.other_container_info}>{shortText(fields.other_container_info, 26)}</span></td>
                           <td><span className="cell-truncate" title={fields.truck_company}>{shortText(fields.truck_company, 24)}</span></td>
                           <td><span className="cell-truncate" title={fields.truck_number}>{shortText(fields.truck_number, 24)}</span></td>
+                          <td>{fields.ocr_confidence}</td>
                           <td>{fields.confidence}</td>
                           <td>{fields.durationSec}</td>
                           <td>{fields.firstSeen}</td>
@@ -738,6 +873,97 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+            ) : dashboardView === "gate" ? (
+              <div className="gate-view">
+                {gateRows.length === 0 && <div className="empty-cell">No detected vehicles yet.</div>}
+                <div className="gate-summary-bar">
+                  <span className="gate-summary-item"><b>{gateRows.length}</b> vehicle{gateRows.length !== 1 ? "s" : ""}</span>
+                  <span className="gate-summary-sep">|</span>
+                  <span className="gate-summary-item trailer-yes"><b>{gateRows.filter(t => (t.truck_type || "").toLowerCase().includes("with_container")).length}</b> with trailer</span>
+                  <span className="gate-summary-sep">|</span>
+                  <span className="gate-summary-item trailer-no"><b>{gateRows.filter(t => !(t.truck_type || "").toLowerCase().includes("with_container")).length}</b> without trailer</span>
+                </div>
+                <div className="gate-cards">
+                  {gateRows.map((truck, idx) => {
+                    const fields = readTruckFields(truck);
+                    const status = truck.review_status || "pending";
+                    const fusion = truck.associated_info?._fusion;
+                    const cameraMap = fusion?.source_track_ids || {};
+                    const cameras = Object.keys(cameraMap);
+                    const hasTrailer = (truck.truck_type || "").toLowerCase().includes("with_container");
+                    const timeRange = `${formatTimeSec(truck.first_seen_time_sec)} – ${formatTimeSec(truck.last_seen_time_sec)}`;
+                    const duration = truck.duration_sec != null ? `${Number(truck.duration_sec).toFixed(1)}s` : "—";
+                    const matchConf = fusion?.match_confidence ?? fields.confidence;
+                    return (
+                      <article key={truck.id} className={`gate-card ${status === "rejected" ? "gate-card-rejected" : ""}`}>
+                        <div className="gate-card-header">
+                          <span className="gate-vehicle-num">Vehicle {idx + 1}</span>
+                          <span className={`gate-type-badge ${hasTrailer ? "badge-trailer" : "badge-no-trailer"}`}>
+                            {hasTrailer ? "WITH TRAILER" : "NO TRAILER"}
+                          </span>
+                          <span className="gate-time">{timeRange}</span>
+                          <span className={`status-chip status-${status}`}>{status}</span>
+                        </div>
+                        {cameras.length > 0 && (
+                          <div className="gate-cameras">
+                            <span className="gate-cameras-label">Cameras</span>
+                            {cameras.map((cam) => (
+                              <span key={cam} className="gate-cam-badge">{cam} <span className="gate-cam-track">T#{cameraMap[cam]}</span></span>
+                            ))}
+                            {truck._groupCount > 1 && cameras.length === 0 && (
+                              <span className="gate-cam-badge">{truck._sourceTracks}</span>
+                            )}
+                          </div>
+                        )}
+                        <div className="gate-fields">
+                          {fields.license_plate !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">License Plate</span>
+                              <span className="gate-field-value strong">{fields.license_plate}</span>
+                            </div>
+                          )}
+                          {fields.container_number !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Container No.</span>
+                              <span className="gate-field-value strong">{fields.container_number}</span>
+                            </div>
+                          )}
+                          {fields.container_side_no !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Side No.</span>
+                              <span className="gate-field-value">{fields.container_side_no}</span>
+                            </div>
+                          )}
+                          {fields.truck_number !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Truck No.</span>
+                              <span className="gate-field-value">{fields.truck_number}</span>
+                            </div>
+                          )}
+                          {fields.truck_company !== "—" && (
+                            <div className="gate-field">
+                              <span className="gate-field-label">Company</span>
+                              <span className="gate-field-value">{fields.truck_company}</span>
+                            </div>
+                          )}
+                          <div className="gate-field">
+                            <span className="gate-field-label">Duration</span>
+                            <span className="gate-field-value">{duration}</span>
+                          </div>
+                          <div className="gate-field">
+                            <span className="gate-field-label">Confidence</span>
+                            <span className="gate-field-value">{matchConf}</span>
+                          </div>
+                        </div>
+                        <div className="row-actions">
+                          <button type="button" className="mini-approve" onClick={() => handleApprove(truck.id)} disabled={status === "rejected"}>Approve</button>
+                          <button type="button" className="mini-reject" onClick={() => handleReject(truck.id)} disabled={status === "rejected"}>Reject</button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
             ) : (
               <div className="list-view">
                 {detectedTrucks.length === 0 && <div className="empty-cell">No detected trucks yet.</div>}
@@ -760,27 +986,14 @@ export default function App() {
                         <p><b>container_number:</b> {fields.container_number}</p>
                         <p><b>container_side_no:</b> {fields.container_side_no}</p>
                         <p><b>other_container_info:</b> {fields.other_container_info}</p>
+                        <p><b>ocr_confidence:</b> {fields.ocr_confidence}</p>
                         <p><b>confidence_avg:</b> {fields.confidence}</p>
                         <p><b>duration_sec:</b> {fields.durationSec}</p>
                         <p><b>last_bbox:</b> {shortText(fields.bbox, 40)}</p>
                       </div>
                       <div className="row-actions">
-                        <button
-                          type="button"
-                          className="mini-approve"
-                          onClick={() => handleApprove(truck.id)}
-                          disabled={status === "rejected"}
-                        >
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          className="mini-reject"
-                          onClick={() => handleReject(truck.id)}
-                          disabled={status === "rejected"}
-                        >
-                          Reject
-                        </button>
+                        <button type="button" className="mini-approve" onClick={() => handleApprove(truck.id)} disabled={status === "rejected"}>Approve</button>
+                        <button type="button" className="mini-reject" onClick={() => handleReject(truck.id)} disabled={status === "rejected"}>Reject</button>
                       </div>
                     </article>
                   );
