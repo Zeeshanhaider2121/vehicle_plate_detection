@@ -292,20 +292,29 @@ def _field_conf(value: Any) -> float:
 
 
 def _text_quality(text: str) -> int:
+    if not text:
+        return 0
     lowered = text.lower()
+    # OCR garbage: image-caption descriptions returned by VLM instead of actual text.
+    # These must return 0 so _better_field and _assign_ocr_fields_to_window discard them.
+    _DEFINITE_GARBAGE = (
+        "abstract grayscale", "abstract gray", "grayscale curved",
+        "no text or symbols", "no text", "no visible text",
+        "not visible", "no symbols", "close-up of", "close up of",
+        "photograph of", "image of", "picture of", "image shows",
+        "background with", "metallic", "cylindrical", "curved shape",
+        "simple geometric",
+    )
+    if any(phrase in lowered for phrase in _DEFINITE_GARBAGE):
+        return 0
     bad_terms = (
         "blurr",
         "indistinct",
         "unrecognizable",
         "unreadable",
-        "not visible",
-        "no visible",
         "unclear",
         "unable",
-        "no text",
     )
-    if not text:
-        return 0
     if any(term in lowered for term in bad_terms):
         return 1
     return 2
@@ -1244,6 +1253,9 @@ def _assign_ocr_fields_to_window(
         best = None
         best_key = None
         for entry in field_hist.values():
+            text = entry.get("text", "")
+            if not text or _text_quality(text) == 0:
+                continue  # drop VLM image-caption garbage ("abstract grayscale …")
             tf = entry.get("time_first_sec")
             tl = entry.get("time_last_sec", tf)
             if tf is None:

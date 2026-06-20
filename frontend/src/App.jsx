@@ -103,66 +103,10 @@ function readOcrFieldValue(value) {
   return "—";
 }
 
-// The truck company is one of these real carriers (read by the rear best_V2 model).
-// OCR often mangles it, so snap whatever was read to the closest one — but only
-// when it is actually close, otherwise the cleaned text is shown as-is.
-const KNOWN_TRUCK_COMPANIES = ["SEAPORT INTERNATIONAL", "AIR AND OCEANLAND INC"];
-
-// A truck number uniquely identifies its carrier. The back model reads the number
-// reliably even when the company text itself is unreadable, so map known numbers to
-// their company and let that win. Edit this map as new trucks/carriers are added.
-const TRUCK_NUMBER_TO_COMPANY = {
-  "801552": "SEAPORT INTERNATIONAL",
-  "463": "AIR AND OCEANLAND INC"
-};
-
-function companyFromTruckNumber(truckNumber) {
-  if (!truckNumber || truckNumber === "—") return null;
-  const digits = String(truckNumber).replace(/[^A-Za-z0-9]/g, "");
-  if (!digits) return null;
-  if (TRUCK_NUMBER_TO_COMPANY[digits]) return TRUCK_NUMBER_TO_COMPANY[digits];
-  // Tolerate leading-zero / partial reads, e.g. "0801552" or "801552KY" -> 801552.
-  for (const [num, company] of Object.entries(TRUCK_NUMBER_TO_COMPANY)) {
-    if (digits === num || digits.endsWith(num) || digits.startsWith(num)) return company;
-  }
-  return null;
-}
-
-function levenshtein(a, b) {
-  const m = a.length;
-  const n = b.length;
-  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
-  for (let j = 0; j <= n; j += 1) dp[0][j] = j;
-  for (let i = 1; i <= m; i += 1) {
-    for (let j = 1; j <= n; j += 1) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
-    }
-  }
-  return dp[m][n];
-}
-
 function normalizeTruckCompany(value) {
   if (value === null || value === undefined || value === "—") return value;
   const cleaned = cleanOcrText(String(value).trim());
   if (!cleaned) return "—";
-  const lower = cleaned.toLowerCase();
-  // Distinguishing tokens win immediately.
-  if (lower.includes("seaport") || lower.includes("sea port")) return "SEAPORT INTERNATIONAL";
-  if (lower.includes("oceanland") || lower.includes("ocean land") || lower.includes("oceanhub")) return "AIR AND OCEANLAND INC";
-  // Otherwise pick the closest canonical name by edit distance, but only accept
-  // it as a match when it is reasonably close — a far-off string (or a different
-  // real carrier) is left as the cleaned OCR text rather than force-snapped.
-  let best = null;
-  let bestDist = Infinity;
-  for (const cand of KNOWN_TRUCK_COMPANIES) {
-    const d = levenshtein(lower, cand.toLowerCase());
-    if (d < bestDist) {
-      bestDist = d;
-      best = cand;
-    }
-  }
-  if (best && bestDist <= Math.ceil(best.length * 0.45)) return best;
   return cleaned.toUpperCase();
 }
 
@@ -196,12 +140,7 @@ function readTruckFields(truck) {
     const cam = readOcrFieldCamera(info[f]);
     if (cam) fieldCameras[f] = cam;
   }
-  // Constrain truck company to a known carrier name, then let the truck number —
-  // the strongest identifier — decide the carrier when it is one we know (the back
-  // model reads the number reliably even when the company text OCR is weak/empty).
   fieldTexts.truck_company = normalizeTruckCompany(fieldTexts.truck_company);
-  const companyByNumber = companyFromTruckNumber(fieldTexts.truck_number);
-  if (companyByNumber) fieldTexts.truck_company = companyByNumber;
   // Show max OCR confidence across filled fields — reflects the best crop selected per class
   const ocrConfs = ocrFields.map((f) => readOcrFieldConfidence(info[f])).filter((c) => c != null);
   const maxOcrConf = ocrConfs.length > 0 ? Math.max(...ocrConfs).toFixed(3) : "—";

@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # Fixed ground-truth truck-changeover timestamps for the gate.  Any track that
     # spans one of these points is split there (one physical truck per segment), and
     # same-camera fragments are never merged across a boundary.
-    truck_time_boundaries_seconds: str = "130,460"
+    truck_time_boundaries_seconds: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,0 +1,166 @@
+{
+  "session": {
+    "video_path": "C:\\Users\\ADMINI~1\\AppData\\Local\\Temp\\plateflow_job_w5cm6dvh\\Front.IN_LANE_2_LPR_NVR_20260525131102_20260525132001_827960.mp4",
+    "total_frames": 16201,
+    "video_fps": 30.0,
+    "resolution": "1280x720",
+    "started_at": "2026-06-17T19:22:52",
+    "device": "cuda",
+    "model": "C:\\Users\\Administrator\\Downloads\\vehicle_plate_detection\\backend\\model\\best.pt",
+    "confidence": 0.73,
+    "truck_confidence": 0.8,
+    "infer_width": 1280,
+    "tracker": "C:\\Users\\Administrator\\Downloads\\vehicle_plate_detection\\backend\\plateflow_outputs\\custom_bytetrack.yaml",
+    "save_detection_crops": true,
+    "lock_after_n_frames": 5,
+    "active_window_frames": 60,
+    "high_iou_merge_thresh": 0.45,
+    "enable_frame_skip": false,
+    "process_every_n_frames": 1,
+    "ocr_every_n_frames": 1,
+    "camera": ""
+  },
+  "summary": {
+    "total_trucks_tracked": 2,
+    "trucks_with_container": 2,
+    "trucks_without_container": 0
+  },
+  "trucks": {
+    "1": {
+      "track_id": 1,
+      "type": "truck_with_container",
+      "camera": "",
+      "first_seen_frame": 0,
+      "last_seen_frame": 189,
+      "first_seen_time_sec": 0.0,
+      "last_seen_time_sec": 6.3,
+      "duration_frames": 190,
+      "duration_sec": 6.333,
+      "confidence_avg": 0.9769,
+      "last_bbox": [
+        3,
+        347,
+        605,
+        718
+      ],
+      "union_bbox": [
+        1,
+        341,
+        607,
+        719
+      ],
+      "associated_info": {
+        "container_number": null,
+        "container_side_no": null,
+        "container_company_logo": null,
+        "other_container_info": null,
+        "license_plate": null,
+        "truck_company": {
+          "text": "Seapun Intermised",
+          "confidence": 0.9717,
+          "camera": ""
+        },
+        "truck_number": {
+          "text": "60752",
+          "confidence": 0.9468,
+          "camera": ""
+        },
+        "_ocr_history": {
+          "truck_company": {
+            "Seapun Intermised": {
+              "text": "Seapun Intermised",
+              "confidence": 0.9717,
+              "camera": "",
+              "time_first_sec": 0.0,
+              "time_last_sec": 0.0,
+              "count": 1
+            }
+          },
+          "truck_number": {
+            "001052": {
+              "text": "001052",
+              "confidence": 0.9448,
+              "camera": "",
+              "time_first_sec": 0.0,
+              "time_last_sec": 0.0,
+              "count": 1
+            },
+            "007352": {
+              "text": "007352",
+              "confidence": 0.9453,
+              "camera": "",
+              "time_first_sec": 0.033,
+              "time_last_sec": 0.033,
+              "count": 1
+            },
+            "007052": {
+              "text": "007052",
+              "confidence": 0.9458,
+              "camera": "",
+              "time_first_sec": 0.167,
+              "time_last_sec": 0.167,
+              "count": 1
+            },
+            "60752": {
+              "text": "60752",
+              "confidence": 0.9468,
+              "camera": "",
+              "time_first_sec": 1.767,
+              "time_last_sec": 1.867,
+              "count": 2
+            }
+          }
+        }
+      }
+    },
+    "2": {
+      "track_id": 2,
+      "type": "truck_with_container",
+      "camera": "",
+      "first_seen_frame": 0,
+      "last_seen_frame": 189,
+      "first_seen_time_sec": 0.0,
+      "last_seen_time_sec": 6.3,
+      "duration_frames": 190,
+      "duration_sec": 6.333,
+      "confidence_avg": 0.9659,
+      "last_bbox": [
+        0,
+        22,
+        589,
+        401
+      ],
+      "union_bbox": [
+        0,
+        21,
+        596,
+        402
+      ],
+      "associated_info": {
+        "container_number": {
+          "text": "SUDU 8227936",
+          "confidence": 0.7983,
+          "camera": ""
+        },
+        "container_side_no": null,
+        "container_company_logo": null,
+        "other_container_info": null,
+        "license_plate": null,
+        "truck_company": null,
+        "truck_number": null,
+        "_ocr_history": {
+          "container_number": {
+            "SUDU 8227936": {
+              "text": "SUDU 8227936",
+              "confidence": 0.7983,
+              "camera": "",
+              "time_first_sec": 1.7,
+              "time_last_sec": 1.867,
+              "count": 2
+            }
+          }
+        }
+      }
+    }
+  }
+}

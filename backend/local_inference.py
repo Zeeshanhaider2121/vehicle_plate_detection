@@ -101,6 +101,83 @@ LOCK_AFTER_N_FRAMES = 5
 # ================ FIX: Greatly reduced active window and raised IoU thresholds
 ACTIVE_WINDOW_FRAMES = _env_int("ACTIVE_WINDOW_FRAMES", 60)      # was 600
 HIGH_IOU_MERGE_THRESH = _env_float("HIGH_IOU_MERGE_THRESH", 0.95) # was 0.50
+# Two truck records that occupy the same spatial region (high union-bbox overlap)
+# but are separated by more than this many frames are DIFFERENT physical trucks
+# (e.g. a 2-min truck and a 7-min truck both driving through the same gate lane).
+# Default: 150 frames = 5 s at 30 fps.  Set MIN_INTER_TRUCK_GAP_FRAMES=0 to disable.
+MIN_INTER_TRUCK_GAP_FRAMES = _env_int("MIN_INTER_TRUCK_GAP_FRAMES", 150)
+
+# ========================= LANE ROI SUPPORT ==================================
+_LANE_ROI_DIR = Path(__file__).resolve().parent
+
+
+def _load_lane_rois(camera_name: str) -> "dict[int, np.ndarray]":
+    """Load per-lane polygon ROIs for a camera from lane_rois.json.
+
+    Looks for ``{camera}_lane_rois.json`` first, then ``lane_rois.json`` in
+    the same directory as this file.  Returns empty dict when nothing is found.
+    ROIs are produced by  backend/roi_picker.py — run it once per camera view.
+    """
+    candidates = [
+        _LANE_ROI_DIR / f"{camera_name}_lane_rois.json",
+        _LANE_ROI_DIR / "lane_rois.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                lanes = data.get("lanes") or {}
+                rois: dict[int, np.ndarray] = {
+                    int(k): np.array(v, np.int32) for k, v in lanes.items()
+                }
+                if rois:
+                    print(f"[PlateFlow][ROI] '{camera_name}': {len(rois)} lane(s) from {path.name}")
+                    return rois
+            except Exception as exc:
+                print(f"[PlateFlow][ROI] Load failed ({path}): {exc}")
+    return {}
+
+
+def _get_detection_lane(
+    bbox: "tuple[int, int, int, int]",
+    rois: "dict[int, np.ndarray]",
+) -> "int | None":
+    """Return the lane ID (1, 2, …) the bounding-box belongs to, or None."""
+    if not rois:
+        return None
+    x1, y1, x2, y2 = bbox
+    ref = ((x1 + x2) // 2, y2)  # bottom-centre — stable for wide trucks
+    for lane_id, polygon in rois.items():
+        if cv2.pointPolygonTest(polygon, ref, False) >= 0:
+            return lane_id
+    return None
+
+
+# ========================= PER-CAMERA DETECTION STATS =======================
+@dataclass
+class CameraDetectionStats:
+    camera: str
+    yolo_with_container: int = 0
+    yolo_without_container: int = 0
+    bytetrack_ids_with_container: set = field(default_factory=set)
+    bytetrack_ids_without_container: set = field(default_factory=set)
+
+    def to_dict(self) -> "dict[str, Any]":
+        return {
+            "camera": self.camera,
+            "yolo_raw_detections": {
+                "truck_with_container": self.yolo_with_container,
+                "truck_without_container": self.yolo_without_container,
+                "total": self.yolo_with_container + self.yolo_without_container,
+            },
+            "bytetrack_unique_ids": {
+                "truck_with_container": len(self.bytetrack_ids_with_container),
+                "truck_without_container": len(self.bytetrack_ids_without_container),
+                "total": len(self.bytetrack_ids_with_container | self.bytetrack_ids_without_container),
+            },
+        }
+
 
 MINERU_TOKEN = "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiI3NzgwMDYzMyIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3OTExMzIyNiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiIiwib3BlbklkIjpudWxsLCJ1dWlkIjoiNWIxM2U3YjctN2FmNi00MzdjLThhZmEtMTIxNTRiMzQyOGQxIiwiZW1haWwiOiIiLCJleHAiOjE3ODY4ODkyMjZ9.gw3idlGC_R1ulaBBXCR_FtVszMw3y7jIbFBwQcjhgCbqVNJaoXTvtUp7GdvpMF117PPbzn1xrqm8YIybpxMN_Q"
 
@@ -460,6 +537,7 @@ def _get_perm_truck_id(
     bbox: tuple[int, int, int, int],
     registry: "TruckRegistry",
     frame_id: int,
+    lane_id: int | None = None,
 ) -> int:
     """
     Map a raw ByteTrack ID to a stable permanent ID.
@@ -484,6 +562,12 @@ def _get_perm_truck_id(
 
     with registry._lock:
         for perm_id, rec in registry.trucks.items():
+            # If both this detection and the candidate have a known lane and
+            # they differ, they are physically in different lanes — never merge.
+            existing_lane = rec.get("lane_id")
+            if lane_id is not None and existing_lane is not None and lane_id != existing_lane:
+                continue
+
             lb = tuple(rec["last_bbox"])
             ub = tuple(rec["union_bbox"])
             score = max(
@@ -555,6 +639,7 @@ def _consolidate_perm_ids(job: VideoJob, registry: "TruckRegistry") -> None:
                 "last_frame": rec["last_seen_frame"],
                 "union_bbox": tuple(rec["union_bbox"]),
                 "duration": rec["duration_frames"],
+                "lane_id": rec.get("lane_id"),
             })
     records.sort(key=lambda r: r["first_frame"])
 
@@ -579,6 +664,29 @@ def _consolidate_perm_ids(job: VideoJob, registry: "TruckRegistry") -> None:
                 print(
                     f"  [CONSOLIDATE] T#{ra['tid']} and T#{rb['tid']} overlap spatially "
                     f"({overlap:.2f}) but are CONCURRENT ({time_overlap} frames) — kept separate"
+                )
+                continue
+            # Sequential trucks in the same lane will have a large time gap even
+            # though their union bboxes overlap (both drive through the same gate
+            # position).  Never merge two records separated by more than
+            # MIN_INTER_TRUCK_GAP_FRAMES — they are different physical trucks.
+            time_gap = max(
+                0,
+                max(ra["first_frame"], rb["first_frame"])
+                - min(ra["last_frame"], rb["last_frame"]),
+            )
+            if MIN_INTER_TRUCK_GAP_FRAMES > 0 and time_gap > MIN_INTER_TRUCK_GAP_FRAMES:
+                print(
+                    f"  [CONSOLIDATE] T#{ra['tid']} and T#{rb['tid']} spatial={overlap:.2f} "
+                    f"but gap={time_gap} frames > {MIN_INTER_TRUCK_GAP_FRAMES} — different trucks, kept separate"
+                )
+                continue
+            # Trucks in physically different lanes are never the same physical truck.
+            la, lb = ra.get("lane_id"), rb.get("lane_id")
+            if la is not None and lb is not None and la != lb:
+                print(
+                    f"  [CONSOLIDATE] T#{ra['tid']} lane={la} vs T#{rb['tid']} lane={lb} "
+                    f"— different lanes, kept separate"
                 )
                 continue
             if ra["duration"] >= rb["duration"]:
@@ -701,11 +809,12 @@ class TruckRegistry:
         self.trucks: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def _new_record(self, tid: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float) -> dict[str, Any]:
+    def _new_record(self, tid: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float, lane_id: int | None = None) -> dict[str, Any]:
         return {
             "track_id": tid,
             "type": cls_name,
             "camera": self.camera_source,
+            "lane_id": lane_id,
             "first_seen_frame": frame_id,
             "last_seen_frame": frame_id,
             "first_seen_time_sec": round(frame_id / self.fps, 3),
@@ -719,10 +828,10 @@ class TruckRegistry:
             "associated_info": {k: v for k, v in self._UNIFIED_TEMPLATE.items()},
         }
 
-    def update(self, track_id: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float) -> None:
+    def update(self, track_id: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float, lane_id: int | None = None) -> None:
         with self._lock:
             if track_id not in self.trucks:
-                self.trucks[track_id] = self._new_record(track_id, cls_name, bbox, frame_id, conf)
+                self.trucks[track_id] = self._new_record(track_id, cls_name, bbox, frame_id, conf, lane_id)
                 return
             rec = self.trucks[track_id]
             rec["last_seen_frame"] = frame_id
@@ -738,6 +847,8 @@ class TruckRegistry:
             n = rec["_conf_n"]
             rec["confidence_avg"] = round((rec["confidence_avg"] * n + conf) / (n + 1), 4)
             rec["_conf_n"] = n + 1
+            if lane_id is not None and rec.get("lane_id") is None:
+                rec["lane_id"] = lane_id
 
     def attach_ocr(self, truck_track_id: int, truck_type: str, field: str, text: str, conf: float = 0.0, image: str | None = None, frame_id: int | None = None) -> None:
         if not text or _is_garbage_ocr(text):
@@ -1270,6 +1381,8 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         "ocr_every_n_frames": OCR_EVERY_N_FRAMES, "camera": job.camera_source if job is not None else "",
     }
     camera_src = job.camera_source if job is not None else ""
+    lane_rois = _load_lane_rois(camera_src) if camera_src else {}
+    camera_stats = CameraDetectionStats(camera=camera_src or "default")
     registry = TruckRegistry(fps=fps, camera_source=camera_src)
     if job is not None:
         _set_job(job.job_id, registry=registry, session_info=session_info, total_frames=total_frames)
@@ -1327,6 +1440,11 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     print(f"  [MASK-AREA] drop {cls_name} T#{track_id} mask_area={mask_area:.0f} < {MIN_TRUCK_MASK_AREA}")
                     continue
                 boxes_data.append((x1, y1, x2, y2, cls_id, conf_val, track_id, mask))
+                # YOLO raw detection counter (one instance per detected box per frame)
+                if cls_name == "truck_with_container":
+                    camera_stats.yolo_with_container += 1
+                elif cls_name == "truck_without_container":
+                    camera_stats.yolo_without_container += 1
                 _save_detection_crop(frame_orig, cls_name, frame_id, i, conf_val, track_id, (x1, y1, x2, y2), detections_dir=detections_dir)
         boxes_data = _dedupe_truck_detections(boxes_data, class_names)
         if job is not None:
@@ -1334,15 +1452,22 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             for x1, y1, x2, y2, cls_id, conf_val, track_id, mask in boxes_data:
                 cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
                 if cls_name in TRUCK_CLASSES and track_id is not None:
-                    perm_id = _get_perm_truck_id(job, track_id, (x1, y1, x2, y2), registry, frame_id)
+                    det_lane = _get_detection_lane((x1, y1, x2, y2), lane_rois)
+                    perm_id = _get_perm_truck_id(job, track_id, (x1, y1, x2, y2), registry, frame_id, det_lane)
                     remapped.append((x1, y1, x2, y2, cls_id, conf_val, perm_id, mask))
+                    # ByteTrack raw unique-ID counter (raw ByteTrack IDs before perm-ID consolidation)
+                    if cls_name == "truck_with_container":
+                        camera_stats.bytetrack_ids_with_container.add(track_id)
+                    else:
+                        camera_stats.bytetrack_ids_without_container.add(track_id)
                 else:
                     remapped.append((x1, y1, x2, y2, cls_id, conf_val, track_id, mask))
             boxes_data = remapped
         for x1, y1, x2, y2, cls_id, conf_val, track_id, _mask in boxes_data:
             cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
             if cls_name in TRUCK_CLASSES and track_id is not None:
-                registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val)
+                det_lane = _get_detection_lane((x1, y1, x2, y2), lane_rois)
+                registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val, det_lane)
         if virtual_truck_mode and boxes_data:
             vx1 = min(b[0] for b in boxes_data)
             vy1 = min(b[1] for b in boxes_data)
@@ -1460,6 +1585,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
     cap.release()
     session_info["finished_at"] = datetime.now().isoformat(timespec="seconds")
     session_info["frames_processed"] = frame_id
+    session_info["camera_detection_stats"] = camera_stats.to_dict()
     final_data = registry.to_dict(session_info)
     if job is not None:
         _set_job(job.job_id, json_snapshot=json.dumps(final_data, indent=2))
