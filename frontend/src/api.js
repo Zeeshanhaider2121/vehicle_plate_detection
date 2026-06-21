@@ -148,3 +148,45 @@ export function getVideoTruckRunFrameUrl(jobId) {
 export function getMultiCameraFrameUrl(jobId, camera) {
   return `${API_BASE_URL}/api/truck-runs/multi-camera/${jobId}/frame/${camera}`;
 }
+
+// ── Lane setup (draw lane ROIs + gate line in the browser) ──────────────────
+
+// Upload a camera video, get back a still frame (as an object URL) to draw on.
+export async function extractLaneFrame(videoFile, camera) {
+  const formData = new FormData();
+  formData.append("video", videoFile);
+  formData.append("camera", camera);
+  const { data } = await api.post("/api/lane-setup/extract-frame", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    responseType: "blob",
+    timeout: 120000
+  });
+  return URL.createObjectURL(data);
+}
+
+// Run the engine's truck detector on sampled frames and label each truck by the
+// DRAFT lanes, so the operator can confirm assignment before saving.
+export async function testLanes(videoFile, camera, lanes, samples = 8) {
+  const formData = new FormData();
+  formData.append("video", videoFile);
+  formData.append("camera", camera);
+  formData.append("lanes", JSON.stringify(lanes));
+  formData.append("samples", String(samples));
+  const { data } = await api.post("/api/lane-setup/test-lanes", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    timeout: 300000
+  });
+  return data;
+}
+
+// Persist lanes + gate line for one camera (coords in NATIVE image pixels).
+export async function saveLaneRois(payload) {
+  const { data } = await api.post("/api/lane-setup/save", payload);
+  return data;
+}
+
+// Read back a saved ROI for re-editing (or { exists:false }).
+export async function getLaneRois(camera) {
+  const { data } = await api.get(`/api/lane-setup/${camera}`);
+  return data;
+}

@@ -42,6 +42,18 @@ from .schemas import (
 from .video_client import LocalVideoService, LocalVideoServiceError
 
 app = FastAPI(title=settings.app_name, version="0.1.0")
+
+# Cross-camera aggregator endpoint (POST /aggregator/aggregate). Defined in
+# app/aggregator.py; this is the only wiring it needs — the single-camera engine
+# and merge logic in this file are untouched.
+from .aggregator import router as aggregator_router  # noqa: E402
+from .lane_setup import router as lane_setup_router  # noqa: E402
+
+if aggregator_router is not None:
+    app.include_router(aggregator_router)
+if lane_setup_router is not None:
+    app.include_router(lane_setup_router)
+
 inference_service = InferenceService()
 video_service = LocalVideoService()
 DEMO_STATIC_DIR = Path(__file__).resolve().parents[1] / "static" / "demo"

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import LaneSetup from "./LaneSetup";
 import {
   fetchTruckRecords,
   finalizeMultiCamera,
@@ -286,6 +287,7 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [dashboardView, setDashboardView] = useState("table");
+  const [showLaneSetup, setShowLaneSetup] = useState(false);
   const [activeJobId, setActiveJobId] = useState("");
   const [streamFrameUrl, setStreamFrameUrl] = useState("");
   const [streamWarning, setStreamWarning] = useState("");
@@ -900,10 +902,18 @@ export default function App() {
                 <small>QUEUE</small>
                 <p>{pendingCount} Pending</p>
               </div>
+              <button
+                className={showLaneSetup ? "toggle-btn active" : "toggle-btn"}
+                onClick={() => setShowLaneSetup((v) => !v)}
+              >
+                {showLaneSetup ? "Close Lane Setup" : "Lane Setup"}
+              </button>
             </div>
           </div>
 
           {message && <div className="message-banner">{message}</div>}
+
+          {showLaneSetup && <LaneSetup onClose={() => setShowLaneSetup(false)} />}
 
           <section className="video-stage">
             <div className="video-main">

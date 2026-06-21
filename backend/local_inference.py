@@ -54,7 +54,7 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 
 MODEL_PATH = os.getenv(
     "MODEL_PATH",
-    str(Path(__file__).resolve().parent / "model" / "best.pt"),
+    str(Path(__file__).resolve().parent / "model" / "V3.pt"),
 )
 OUTPUT_DIR = os.getenv(
     "OUTPUT_DIR",
@@ -62,7 +62,7 @@ OUTPUT_DIR = os.getenv(
 )
 MODEL_PATH_BACK = os.getenv(
     "MODEL_PATH_BACK",
-    str(Path(__file__).resolve().parent / "model" / "best_V2.pt"),
+    str(Path(__file__).resolve().parent / "model" / "V3.pt"),
 )
 OUTPUT_DIR_BACK = os.getenv(
     "OUTPUT_DIR_BACK",
@@ -152,6 +152,53 @@ def _get_detection_lane(
         if cv2.pointPolygonTest(polygon, ref, False) >= 0:
             return lane_id
     return None
+
+
+def _load_gate_line(camera_name: str) -> "tuple[tuple[int, int], tuple[int, int]] | None":
+    """Load the physical gate tripwire (two points) drawn for a camera, or None.
+
+    Lives in the same ``{camera}_lane_rois.json`` the lane picker writes (key
+    ``gate_line``). Drawn once via the in-browser Lane Setup tool.
+    """
+    candidates = [
+        _LANE_ROI_DIR / f"{camera_name}_lane_rois.json",
+        _LANE_ROI_DIR / "lane_rois.json",
+    ]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            line = data.get("gate_line")
+            if isinstance(line, list) and len(line) == 2:
+                (x1, y1), (x2, y2) = line
+                print(f"[PlateFlow][GATE] '{camera_name}': gate line from {path.name}")
+                return ((int(x1), int(y1)), (int(x2), int(y2)))
+        except Exception as exc:
+            print(f"[PlateFlow][GATE] Load failed ({path}): {exc}")
+        return None
+    return None
+
+
+def _gate_side(
+    bbox: "tuple[int, int, int, int]",
+    gate_line: "tuple[tuple[int, int], tuple[int, int]]",
+) -> int:
+    """Which side of the gate line the truck's bottom-centre is on: +1, -1, or 0.
+
+    Sign of the 2-D cross product (p2-p1) x (ref-p1). A flip in sign between frames
+    means the truck crossed the line.
+    """
+    x1, y1, x2, y2 = bbox
+    rx, ry = (x1 + x2) // 2, y2  # bottom-centre — same reference as lane gating
+    (ax, ay), (bx, by) = gate_line
+    cross = (bx - ax) * (ry - ay) - (by - ay) * (rx - ax)
+    if cross > 0:
+        return 1
+    if cross < 0:
+        return -1
+    return 0
 
 
 # ========================= PER-CAMERA DETECTION STATS =======================
@@ -825,15 +872,24 @@ class TruckRegistry:
             "_conf_n": 1,
             "last_bbox": list(bbox),
             "union_bbox": list(bbox),
+            # Gate tripwire (filled only when a gate line is configured for this camera):
+            "gate_crossed": False,
+            "gate_cross_frame": None,
+            "gate_cross_time_sec": None,
+            "_gate_prev_side": None,
             "associated_info": {k: v for k, v in self._UNIFIED_TEMPLATE.items()},
         }
 
-    def update(self, track_id: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float, lane_id: int | None = None) -> None:
+    def update(self, track_id: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float, lane_id: int | None = None, gate_side: int | None = None) -> None:
         with self._lock:
             if track_id not in self.trucks:
-                self.trucks[track_id] = self._new_record(track_id, cls_name, bbox, frame_id, conf, lane_id)
+                rec = self._new_record(track_id, cls_name, bbox, frame_id, conf, lane_id)
+                self.trucks[track_id] = rec
+                if gate_side is not None and gate_side != 0:
+                    rec["_gate_prev_side"] = gate_side
                 return
             rec = self.trucks[track_id]
+            self._update_gate_crossing(rec, gate_side, frame_id)
             rec["last_seen_frame"] = frame_id
             rec["last_seen_time_sec"] = round(frame_id / self.fps, 3)
             rec["duration_frames"] = frame_id - rec["first_seen_frame"] + 1
@@ -849,6 +905,19 @@ class TruckRegistry:
             rec["_conf_n"] = n + 1
             if lane_id is not None and rec.get("lane_id") is None:
                 rec["lane_id"] = lane_id
+
+    def _update_gate_crossing(self, rec: dict[str, Any], gate_side: int | None, frame_id: int) -> None:
+        """Stamp the crossing frame/time the FIRST time a track flips sides of the gate line."""
+        if gate_side is None or gate_side == 0:
+            return
+        prev = rec.get("_gate_prev_side")
+        if prev is not None and prev != gate_side and not rec.get("gate_crossed"):
+            rec["gate_crossed"] = True
+            rec["gate_cross_frame"] = frame_id
+            rec["gate_cross_time_sec"] = round(frame_id / self.fps, 3)
+            print(f"  [GATE] T#{rec['track_id']} crossed the gate line at "
+                  f"frame {frame_id} ({rec['gate_cross_time_sec']}s)")
+        rec["_gate_prev_side"] = gate_side
 
     def attach_ocr(self, truck_track_id: int, truck_type: str, field: str, text: str, conf: float = 0.0, image: str | None = None, frame_id: int | None = None) -> None:
         if not text or _is_garbage_ocr(text):
@@ -1382,6 +1451,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
     }
     camera_src = job.camera_source if job is not None else ""
     lane_rois = _load_lane_rois(camera_src) if camera_src else {}
+    gate_line = _load_gate_line(camera_src) if camera_src else None
     camera_stats = CameraDetectionStats(camera=camera_src or "default")
     registry = TruckRegistry(fps=fps, camera_source=camera_src)
     if job is not None:
@@ -1467,7 +1537,8 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
             cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
             if cls_name in TRUCK_CLASSES and track_id is not None:
                 det_lane = _get_detection_lane((x1, y1, x2, y2), lane_rois)
-                registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val, det_lane)
+                gate_side = _gate_side((x1, y1, x2, y2), gate_line) if gate_line else None
+                registry.update(track_id, cls_name, (x1, y1, x2, y2), frame_id, conf_val, det_lane, gate_side)
         if virtual_truck_mode and boxes_data:
             vx1 = min(b[0] for b in boxes_data)
             vy1 = min(b[1] for b in boxes_data)

@@ -1,10 +1,17 @@
 """
 ROI Lane Picker — click 4 corner points per lane to define polygon ROIs.
-Output is saved as  lane_rois.json  next to the video file.
+
+Output is saved as  {camera}_lane_rois.json  in the backend/ directory (next to
+local_inference.py), which is the ONLY place the engine's _load_lane_rois() looks.
+Run it once per camera that sees more than one lane (typically right and left).
 
 Usage
 -----
-    python roi_picker.py path/to/video.mp4
+    python roi_picker.py path/to/right_cam.mp4 --camera right
+    python roi_picker.py path/to/left_cam.mp4  --camera left
+
+The --camera name MUST match the camera name the inference pipeline uses, or the
+engine won't pair the ROI file with the job.
 
 Controls
 --------
@@ -130,9 +137,12 @@ def _save(video_path: str, frame_no: int, camera_name: str = "") -> None:
         print("  Nothing to save — define at least one lane first.")
         return
 
-    # Save as  {camera}_lane_rois.json  — local_inference.py looks for this first
+    # Save as  {camera}_lane_rois.json  — local_inference.py looks for this first.
+    # IMPORTANT: the engine's _load_lane_rois() only searches the directory that
+    # local_inference.py lives in (backend/), NOT next to the video. roi_picker.py
+    # sits in that same backend/ directory, so write there or the engine never finds it.
     stem = f"{camera_name}_lane_rois" if camera_name else "lane_rois"
-    out_path = Path(video_path).parent / f"{stem}.json"
+    out_path = Path(__file__).resolve().parent / f"{stem}.json"
     payload = {
         "video": str(video_path),
         "camera": camera_name,
