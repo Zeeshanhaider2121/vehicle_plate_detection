@@ -167,6 +167,25 @@ TRUCK_TIME_BOUNDARIES: list[float] = sorted(
     if s.strip()
 )
 
+# ── Time-synchronized cross-camera gate sweep (consolidation) ────────────────
+MULTI_CAMERA_GATE_SWEEP = settings.multi_camera_gate_sweep
+FRONT_FACING_CAMERAS: set[str] = {
+    c.strip().lower() for c in settings.front_facing_cameras.split(",") if c.strip()
+}
+BACK_CAMERAS: set[str] = {
+    c.strip().lower() for c in settings.back_cameras.split(",") if c.strip()
+}
+MIN_START_SUPPORT = settings.min_start_support
+CORROBORATION_WINDOW_S = settings.corroboration_window_s
+NEW_TRUCK_GAP_S = settings.new_truck_gap_s
+BACK_ATTACH_LEAD_S = settings.back_attach_lead_s
+BACK_ATTACH_WINDOW_S = settings.back_attach_window_s
+PLATE_PROVENANCE_ORDER: list[str] = [
+    c.strip().lower()
+    for c in (settings.plate_provenance_order or settings.multi_camera_order).split(",")
+    if c.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list or ["*"],
@@ -1378,6 +1397,163 @@ def _derive_camera_sessions(
     return sessions, offsets
 
 
+def _camera_role_kind(camera: str) -> str | None:
+    """Classify a camera as 'back' (interior), 'front' (front-facing gate cam), or
+    None (unknown).  Config-driven via FRONT_FACING_CAMERAS / BACK_CAMERAS."""
+    c = (camera or "").lower()
+    if c in BACK_CAMERAS:
+        return "back"
+    if c in FRONT_FACING_CAMERAS:
+        return "front"
+    return None
+
+
+def _obs_t0(obs: dict[str, Any]) -> float:
+    try:
+        return float(obs["truck"].get("first_seen_time_sec") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _obs_t1(obs: dict[str, Any]) -> float:
+    value = obs["truck"].get("last_seen_time_sec")
+    try:
+        return float(value) if value is not None else _obs_t0(obs)
+    except (TypeError, ValueError):
+        return _obs_t0(obs)
+
+
+def _group_observations_by_gate_sweep(
+    observations: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    """Time-synchronized cross-camera consolidation — one group == one physical truck.
+
+    Implements the gate-sweep algorithm using the config knobs (MIN_START_SUPPORT,
+    CORROBORATION_WINDOW_S, NEW_TRUCK_GAP_S, BACK_ATTACH_LEAD_S, BACK_ATTACH_WINDOW_S):
+
+      1. Common time axis: each observation already carries offset-adjusted
+         first/last_seen_time_sec (seconds) from _apply_camera_time_offset.
+      2-4. Sweep front-facing start events in time order (NOT camera-by-camera).
+         Front starts are pre-clustered into entry "bursts" (consecutive starts chained
+         when each is within CORROBORATION_WINDOW_S of the previous). A burst opens a
+         NEW truck only when corroborated (>= MIN_START_SUPPORT distinct front cameras)
+         or separated from the open truck's last activity by > NEW_TRUCK_GAP_S; an
+         uncorroborated, non-separated burst is a re-acquisition/split ABSORBED into the
+         open truck.  A truck may legitimately own several track ids from one camera.
+      5. Back attaches only on deactivation: a back track joins the truck whose
+         front-camera exit (last front end) is within
+         [back.start - BACK_ATTACH_WINDOW_S, back.start + BACK_ATTACH_LEAD_S]
+         expressed as exit ∈ [back.start - window, back.start + lead]; nearest exit
+         wins, each back track serves at most one truck, and an unmatched back track is
+         logged as an orphan — never spawned as its own truck.
+
+    HARD INVARIANTS: no single truck split across IDs (re-acquisitions absorb); no two
+    distinct trucks merged (only a corroborated burst, i.e. a genuine new entry seen by
+    multiple cameras, opens a new truck).
+    """
+    front: list[dict[str, Any]] = []
+    back: list[dict[str, Any]] = []
+    for obs in observations:
+        if _camera_role_kind(obs["camera"]) == "back":
+            back.append(obs)
+        else:
+            # Unknown cameras are treated as front-facing so they still corroborate.
+            front.append(obs)
+
+    starts = sorted(front, key=_obs_t0)
+    _mc_log(
+        f"[GATE-SWEEP] front_starts={len(starts)} back_tracks={len(back)} "
+        f"min_support={MIN_START_SUPPORT} corro_win={CORROBORATION_WINDOW_S}s "
+        f"new_gap={NEW_TRUCK_GAP_S}s attach=[exit-{BACK_ATTACH_WINDOW_S}s, exit+{BACK_ATTACH_LEAD_S}s]"
+    )
+
+    # Pre-cluster front starts into entry bursts (chain when within the window).
+    bursts: list[list[dict[str, Any]]] = []
+    for obs in starts:
+        if bursts and (_obs_t0(obs) - _obs_t0(bursts[-1][-1])) <= CORROBORATION_WINDOW_S:
+            bursts[-1].append(obs)
+        else:
+            bursts.append([obs])
+
+    trucks: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for burst in bursts:
+        b_t0 = _obs_t0(burst[0])
+        b_t1 = max(_obs_t1(o) for o in burst)
+        distinct_cams = {o["camera"] for o in burst}
+        corroborated = len(distinct_cams) >= MIN_START_SUPPORT
+        burst_label = ", ".join(f"{o['camera']}/T#{o['truck'].get('track_id','?')}" for o in burst)
+        # Absorb (re-acquisition/split) only when there IS an open truck, the burst is
+        # NOT a corroborated fresh entry, and it is within the new-truck gap of it.
+        if current is not None and not corroborated and (b_t0 - current["last_seen"]) <= NEW_TRUCK_GAP_S:
+            current["members"].extend(burst)
+            current["last_seen"] = max(current["last_seen"], b_t1)
+            _mc_log(f"  [ABSORB] truck {len(trucks)} <- [{burst_label}] (re-acquisition/split)")
+        else:
+            if current is None:
+                reason = "first entry"
+            elif corroborated:
+                reason = f"corroborated by {sorted(distinct_cams)}"
+            else:
+                reason = f"gap {b_t0 - current['last_seen']:.2f}s > {NEW_TRUCK_GAP_S}s"
+            current = {"entry_t": b_t0, "last_seen": b_t1, "members": list(burst)}
+            trucks.append(current)
+            _mc_log(f"  [ENTRY] truck {len(trucks)} @{b_t0:.2f}s <- [{burst_label}] ({reason})")
+
+    # Step 5 — back attaches only on deactivation; nearest exit wins, one truck each.
+    exits = [t["last_seen"] for t in trucks]
+    for b in sorted(back, key=_obs_t0):
+        b_t0 = _obs_t0(b)
+        candidates = [
+            i for i, exit_t in enumerate(exits)
+            if (b_t0 - BACK_ATTACH_WINDOW_S) <= exit_t <= (b_t0 + BACK_ATTACH_LEAD_S)
+        ]
+        b_label = f"{b['camera']}/T#{b['truck'].get('track_id','?')} @{b_t0:.2f}s"
+        if not candidates:
+            _mc_log(f"  [BACK-ORPHAN] {b_label} -> no truck deactivated in window (not spawned)")
+            continue
+        best = min(candidates, key=lambda i: abs(b_t0 - exits[i]))
+        trucks[best]["members"].append(b)
+        _mc_log(f"  [BACK-ATTACH] {b_label} -> truck {best + 1} (exit {exits[best]:.2f}s)")
+
+    return [t["members"] for t in trucks if t["members"]]
+
+
+def _apply_plate_provenance(entity: dict[str, Any], group: list[dict[str, Any]]) -> None:
+    """Step 6 — set the consolidated license_plate by camera preference order.
+
+    Walk PLATE_PROVENANCE_ORDER; for the first camera in the group that has a usable
+    plate read, keep its highest-confidence read.  Leaves the merged value untouched
+    if no preferred camera read a plate."""
+    info = entity.get("associated_info")
+    if not isinstance(info, dict):
+        return
+    for camera in PLATE_PROVENANCE_ORDER:
+        reads = []
+        for obs in group:
+            if (obs.get("camera") or "").lower() != camera:
+                continue
+            field = (obs["truck"].get("associated_info") or {}).get("license_plate")
+            text = _field_text(field)
+            if text and _text_quality(text) > 0:
+                reads.append(field)
+        if reads:
+            info["license_plate"] = max(reads, key=_field_conf)
+            return
+
+
+def _apply_front_facing_main_class(entity: dict[str, Any], group: list[dict[str, Any]]) -> None:
+    """The main class (truck_with_container / truck_without_container) is decided by
+    front-facing cameras only; the interior (back) camera never sets it."""
+    types = [
+        str(obs["truck"].get("type") or "")
+        for obs in group
+        if _camera_role_kind(obs["camera"]) != "back" and obs["truck"].get("type")
+    ]
+    if types:
+        entity["type"] = "truck_with_container" if "truck_with_container" in types else types[0]
+
+
 def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
     observations: list[dict[str, Any]] = []
     total_frames = 0
@@ -1389,6 +1565,10 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     camera_sessions, effective_offsets = _derive_camera_sessions(camera_payloads)
     _mc_log(f"[CAMERA-SYNC] offsets(sec)={effective_offsets}  "
             f"starts={ {c: s.get('start_time') for c, s in camera_sessions.items()} }")
+
+    # The gate sweep is the default consolidation, but explicit ground-truth boundaries
+    # and gate_mode still take precedence (they are coarser, more specific overrides).
+    use_sweep = MULTI_CAMERA_GATE_SWEEP and not TRUCK_TIME_BOUNDARIES and not MULTI_CAMERA_GATE_MODE
 
     for camera, payload in camera_payloads.items():
         session = payload.get("session") or {}
@@ -1404,7 +1584,24 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             models.add(str(session["model"]))
 
         trucks = payload.get("trucks") or {}
-        if trucks:
+        if not trucks:
+            continue
+        if use_sweep:
+            # Feed RAW per-camera tracks (offset-aligned only). The sweep does its own
+            # entry detection + assignment, so within-camera fragment merging — which
+            # can wrongly fuse two tailgating trucks that share no readable id — is
+            # intentionally skipped here; re-acquisitions are absorbed by the sweep.
+            for track_key, truck in trucks.items():
+                normalized = (
+                    _normalize_truck_payload(str(track_key), truck)
+                    if isinstance(truck, dict)
+                    else _truck_info_to_dict(str(track_key), truck)
+                )
+                observations.append({
+                    "camera": camera,
+                    "truck": _apply_camera_time_offset(normalized, camera, effective_offsets),
+                })
+        else:
             # Merge re-tracked fragments within this camera before grouping
             # (e.g. left/T#3 [451–493s] + left/T#4 [496–509s] → single truck 3)
             for merged_truck in _merge_track_fragments(trucks):
@@ -1483,6 +1680,19 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
         # Gate setup: one vehicle at a time, all cameras see the same truck.
         # Merge every observation regardless of per-camera count.
         group_specs = [(observations, "gate_mode", 0.95)]
+    elif use_sweep:
+        # PRIMARY STRATEGY: time-synchronized cross-camera gate sweep. Front cameras
+        # corroborate truck entries; re-acquisitions/splits are absorbed; the back
+        # camera attaches only after a truck deactivates up front. See
+        # _group_observations_by_gate_sweep for the invariants.
+        group_specs = []
+        for sweep_group in _group_observations_by_gate_sweep(observations):
+            front_cams = {g["camera"] for g in sweep_group if _camera_role_kind(g["camera"]) != "back"}
+            if len(front_cams) > 1:
+                method, confidence = "gate_sweep", 0.9
+            else:
+                method, confidence = "gate_sweep_single", 0.6
+            group_specs.append((sweep_group, method, confidence))
     elif (
         MULTI_CAMERA_ASSUME_SINGLE_ENTITY
         and observations_by_camera
@@ -1516,7 +1726,12 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             for g in group
         )
         _mc_log(f"  group {index}: [{labels}]  method={match_method}  conf={match_confidence}")
-        merged_entities.append(_merge_truck_group(index, group, match_method, match_confidence, _roles))
+        entity = _merge_truck_group(index, group, match_method, match_confidence, _roles)
+        if isinstance(match_method, str) and match_method.startswith("gate_sweep"):
+            # Step 6: plate by camera-preference order; main class from gate cams only.
+            _apply_plate_provenance(entity, group)
+            _apply_front_facing_main_class(entity, group)
+        merged_entities.append(entity)
 
     # Issue 7 — suppress ghost detections: an entity with NO identifying data
     # (container number, license plate, truck number) AND a duration under 5 s is a

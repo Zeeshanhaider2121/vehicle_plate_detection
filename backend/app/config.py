@@ -29,6 +29,31 @@ class Settings(BaseSettings):
     # same-camera fragments are never merged across a boundary.
     truck_time_boundaries_seconds: str = ""
 
+    # ── Time-synchronized cross-camera gate sweep ──────────────────────────────
+    # Consolidate per-camera tracks into one record per physical truck. Front-facing
+    # cameras share one timeline and corroborate truck ENTRIES; the interior (back)
+    # camera attaches only AFTER a truck deactivates up front. All knobs are config —
+    # re-targeting another gate (different camera names/counts/timing) is config-only.
+    multi_camera_gate_sweep: bool = True
+    # Camera roles for the sweep (comma lists). Anything not listed as back is treated
+    # as front-facing so unknown cameras still corroborate entries.
+    front_facing_cameras: str = "front,right,left"
+    back_cameras: str = "back"
+    # A start opens a NEW truck only when >= min_start_support DISTINCT front cameras
+    # start within corroboration_window_s, OR it is > new_truck_gap_s after the open
+    # truck's last activity. Otherwise it is a re-acquisition/split and is ABSORBED.
+    min_start_support: int = 2
+    corroboration_window_s: float = 1.5
+    new_truck_gap_s: float = 6.0
+    # A back track attaches to a truck only if it STARTS within
+    # [exit - back_attach_lead_s, exit + back_attach_window_s] of that truck's
+    # front-camera exit time (last front end). Never while still active up front.
+    back_attach_lead_s: float = 1.0
+    back_attach_window_s: float = 13.0
+    # Camera preference order for the consolidated plate (highest-confidence read in
+    # the first listed camera that has one). Empty -> reuse multi_camera_order.
+    plate_provenance_order: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -169,3 +169,76 @@ def test_back_orphan_when_outside_window():
     out = aggregate(results, AggregatorConfig())
     assert out["truck_count"] == 2  # still just the two gate trucks
     assert len(out["validation"]["orphan_back_records"]) == 1
+
+
+def test_time_sync_offset_aligns_back_for_attachment():
+    """
+    Time sync between cameras is realised by per-camera clock offsets, not by touching
+    the engine. The gate cams (front/right/left) share one timeline — the truck enters
+    at the same frame on all three (here 0.0 / 0.5 / 1.0, inside gate_sync_tolerance_sec)
+    so they collapse to ONE lane-1 event. BACK is the deferred, "10 seconds behind" cam.
+
+    Here BACK's own video clock runs 20 s ahead, so its raw first_seen=140 looks 20 s
+    past the gate exit (120) — outside the 10 s window. Supplying camera_time_offset_sec
+    for BACK realigns it onto the gate timeline (140 − 20 = 120), placing it right at the
+    gate exit so it attaches and hands over truck_number/truck_company.
+
+    No offset  -> BACK is an orphan (no truck_number on the row).
+    Right offset -> BACK attaches. Pure config; never spawns an id of its own.
+    """
+    results = {
+        "front": [_truck("1", 1, 0.0, 120.0, "front", type_="truck_with_container",
+                         license_plate=("MU-A-1", 0.90))],
+        "right": [_truck("1", 2, 0.5, 119.0, "right", type_="truck_with_container")],
+        "left":  [_truck("1", 3, 1.0, 118.0, "left",  type_="truck_with_container")],
+        "back":  [_truck("1", 9, 140.0, 145.0, "back",
+                         truck_number=("60752", 0.95), truck_company=("Seapun", 0.94))],
+    }
+
+    # Unaligned: BACK's clock is 20 s ahead -> it lands outside the 10 s window -> orphan.
+    out_unaligned = aggregate(results, AggregatorConfig())
+    assert out_unaligned["truck_count"] == 1            # BACK never makes a truck
+    assert len(out_unaligned["validation"]["orphan_back_records"]) == 1
+    assert "truck_number" not in out_unaligned["trucks"][0]["fields"]
+
+    # Aligned: shift BACK back onto the gate timeline; now it attaches inside the window.
+    cfg = AggregatorConfig()
+    cfg.camera_time_offset_sec = {"back": -20.0}
+    out_aligned = aggregate(results, cfg)
+    assert out_aligned["validation"]["orphan_back_records"] == []
+    assert out_aligned["truck_count"] == 1              # still no extra id from BACK
+    row = out_aligned["trucks"][0]
+    assert row["fields"]["truck_number"]["value"] == "60752"
+    assert row["fields"]["truck_number"]["source"] == "BACK"
+    assert row["fields"]["truck_company"]["value"] == "Seapun"
+
+
+def test_back_only_contributes_truck_identity_no_id_no_gate_fields():
+    """
+    From BACK we want ONLY truck_number + truck_company — never a new id, and never a
+    gate-role field (license_plate / container_number), even when BACK emits one at
+    HIGHER confidence than the gate cams. Gate fields stay with the gate cameras.
+    """
+    results = {
+        "front": [_truck("1", 1, 0.0, 120.0, "front", type_="truck_with_container",
+                         license_plate=("MU-A-1", 0.80),
+                         container_number=("CONTA-1", 0.80))],
+        "back":  [_truck("1", 9, 122.0, 128.0, "back",
+                         truck_number=("60752", 0.95), truck_company=("Seapun", 0.94),
+                         license_plate=("BACK-PLATE", 0.99),       # bogus, must be ignored
+                         container_number=("BACK-CONT", 0.99))],   # bogus, must be ignored
+    }
+    out = aggregate(results, AggregatorConfig())
+    assert out["truck_count"] == 1          # BACK generated no id of its own
+    f = out["trucks"][0]["fields"]
+
+    # Interior identity fields come from BACK.
+    assert f["truck_number"]["value"] == "60752"
+    assert f["truck_number"]["source"] == "BACK"
+    assert f["truck_company"]["value"] == "Seapun"
+
+    # Gate-role fields ignore BACK even at higher confidence.
+    assert f["license_plate"]["value"] == "MU-A-1"
+    assert f["license_plate"]["source"] != "BACK"
+    assert f["container_number"]["value"] == "CONTA-1"
+    assert f["container_number"]["source"] != "BACK"
