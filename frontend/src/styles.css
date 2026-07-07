@@ -804,6 +804,8 @@ th {
 .ocr-log-line.log-vote { color: #8a6d1a; background: rgba(232, 153, 42, 0.06); }
 .ocr-log-line.log-best { color: #3f8cff; background: rgba(79, 140, 255, 0.06); }
 .ocr-log-line.log-orphan { color: #c03939; background: rgba(229, 83, 83, 0.06); }
+/* Each raw OCR read the moment it returns (RECV←OCR) — highlighted so live reads stand out. */
+.ocr-log-line.log-read { color: #1b1b1b; font-weight: 600; background: rgba(18, 184, 134, 0.16); border-left: 3px solid #12b886; }
 
 /* ── Gate View ────────────────────────────────────────────────── */
 .gate-view { padding: 12px 0; }
@@ -1051,6 +1053,21 @@ th {
   padding: 2px 8px;
   border-radius: 5px;
   border: 1px solid rgba(91, 168, 255, 0.35);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.lane-chip {
+  display: inline-block;
+  margin-left: 6px;
+  background: #143a1f;
+  color: #56e08a;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(86, 224, 138, 0.4);
   vertical-align: middle;
   white-space: nowrap;
 }
@@ -1507,4 +1524,56 @@ th {
   font-size: 11px;
   color: #6f86a8;
   text-align: center;
+}
+
+/* ── Gate-line setup ───────────────────────────────────────────────────── */
+.lane-setup {
+  border: 1px solid #d3d1c7;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 20px;
+  background: #faf9f5;
+  /* The panel lives inside a 100vh, overflow:hidden workspace. Cap it to the
+     viewport and let it scroll on its own so the frame's bottom is always
+     reachable no matter how the header/controls wrap. */
+  max-height: calc(100vh - 72px);
+  overflow-y: auto;
+}
+.lane-setup-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.lane-setup-hint { color: #5f5e5a; font-size: 13px; margin: 4px 0 12px; }
+.lane-tabs, .lane-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.lane-controls .spacer { flex: 1; }
+.lane-mode-label { font-size: 13px; font-weight: 600; color: #378add; }
+.file-btn {
+  display: inline-block;
+  padding: 6px 12px;
+  border: 1px solid #888780;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  background: #fff;
+}
+.lane-canvas {
+  border: 1px solid #d3d1c7;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1c1c1a;
+  display: flex;
+  justify-content: center;
+}
+.lane-placeholder {
+  padding: 48px 16px;
+  text-align: center;
+  color: #b4b2a9;
+  font-size: 14px;
 }

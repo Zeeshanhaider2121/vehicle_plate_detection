@@ -47,12 +47,9 @@ app = FastAPI(title=settings.app_name, version="0.1.0")
 # app/aggregator.py; this is the only wiring it needs — the single-camera engine
 # and merge logic in this file are untouched.
 from .aggregator import router as aggregator_router  # noqa: E402
-from .lane_setup import router as lane_setup_router  # noqa: E402
 
 if aggregator_router is not None:
     app.include_router(aggregator_router)
-if lane_setup_router is not None:
-    app.include_router(lane_setup_router)
 
 inference_service = InferenceService()
 video_service = LocalVideoService()
@@ -149,6 +146,23 @@ def _parse_camera_roles(raw: str) -> dict[str, set[str]]:
     return roles
 
 
+def _parse_camera_orientation(raw: str) -> set[str]:
+    """Parse 'right:flip,left:flip' into {'right', 'left'} (cameras to mirror).
+
+    Any camera tagged ``flip`` has its normalized center-x mirrored (1 - cx) before
+    left->right lane ordering, because side cameras face the gate from opposite
+    angles so screen-left != world-left."""
+    flipped: set[str] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        camera, mode = part.split(":", 1)
+        if mode.strip().lower() == "flip" and camera.strip():
+            flipped.add(camera.strip().lower())
+    return flipped
+
+
 MULTI_CAMERA_ASSUME_SINGLE_ENTITY = settings.multi_camera_assume_single_entity
 MULTI_CAMERA_ORDER_FALLBACK = settings.multi_camera_order_fallback
 MULTI_CAMERA_REVIEW_THRESHOLD = settings.multi_camera_review_threshold
@@ -180,11 +194,64 @@ CORROBORATION_WINDOW_S = settings.corroboration_window_s
 NEW_TRUCK_GAP_S = settings.new_truck_gap_s
 BACK_ATTACH_LEAD_S = settings.back_attach_lead_s
 BACK_ATTACH_WINDOW_S = settings.back_attach_window_s
+BACK_ATTACH_BY_TIME = settings.multi_camera_back_attach_by_time
 PLATE_PROVENANCE_ORDER: list[str] = [
     c.strip().lower()
     for c in (settings.plate_provenance_order or settings.multi_camera_order).split(",")
     if c.strip()
 ]
+# Fixed extra lag added to the back camera's timeline (trucks reach it after the
+# front cameras). See _derive_camera_sessions.
+BACK_EXTRA_OFFSET_S = settings.back_extra_offset_s
+# Fields collected from ALL cameras (best-confidence, role-owner wins ties) rather
+# than exclusively from the role owner.  See _merge_truck_group.
+MULTI_CAMERA_SHARED_FIELDS: set[str] = {
+    f.strip() for f in settings.multi_camera_shared_fields.split(",") if f.strip()
+}
+SHARED_FIELD_CONF_TIE_EPS = settings.shared_field_conf_tie_eps
+# Side-by-side horizontal split knobs.  See _group_observations_by_gate_sweep.
+MULTI_CAMERA_SIDE_BY_SIDE_SPLIT = settings.multi_camera_side_by_side_split
+SIDE_BY_SIDE_MIN_OVERLAP_RATIO = settings.side_by_side_min_overlap_ratio
+SIDE_BY_SIDE_MIN_CENTERX_GAP = settings.side_by_side_min_centerx_gap
+CAMERA_ORIENTATION_FLIP: set[str] = _parse_camera_orientation(
+    settings.side_by_side_camera_orientation
+)
+DEFAULT_FRAME_WIDTH = settings.default_frame_width
+
+# ── Supervisor camera (front-trio synchronized confirmation) ──────────────────
+# The supervisor is the authority over the front trio: it confirms trucks from the
+# per-frame track logs (front-trio agreement + distinct-coordinates rule) and emits
+# them to this consolidation layer, which then attaches the back camera (step 3).
+# It falls back transparently to the coarser burst sweep when per-frame logs are
+# absent (EMIT_FRAME_TRACKS=0 or older results).
+from .supervisor_camera import (  # noqa: E402
+    SupervisorCamera,
+    configure_supervisor_logger,
+    get_supervisor_logger,
+    supervisor_config_from_settings,
+)
+
+SUPERVISOR_ENABLED = settings.supervisor_enabled
+SUPERVISOR_BACK_WINDOW_S = settings.supervisor_back_window_s
+_SUPERVISOR_CONFIG = supervisor_config_from_settings(settings)
+# Wire the dedicated supervisor log file up front so back-attach logging (below) and
+# the supervisor itself share one handler.
+configure_supervisor_logger(_SUPERVISOR_CONFIG.log_path, _SUPERVISOR_CONFIG.log_level)
+_supervisor_singleton: SupervisorCamera | None = None
+
+
+def _get_supervisor() -> SupervisorCamera:
+    global _supervisor_singleton
+    if _supervisor_singleton is None:
+        _supervisor_singleton = SupervisorCamera(_SUPERVISOR_CONFIG)
+    return _supervisor_singleton
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 app.add_middleware(
     CORSMiddleware,
@@ -445,6 +512,10 @@ def _normalize_truck_payload(track_key: str, truck: dict[str, Any]) -> dict[str,
         "duration_sec": truck.get("duration_sec"),
         "confidence_avg": truck.get("confidence_avg") or truck.get("conf"),
         "last_bbox": truck.get("last_bbox"),
+        "union_bbox": truck.get("union_bbox"),
+        # Lane the truck occupied (its lane ROI). Kept top-level for the merge and
+        # mirrored under associated_info["_lane"] by the engine for DB persistence.
+        "lane": truck.get("lane") if truck.get("lane") is not None else (info.get("_lane") if isinstance(info, dict) else None),
         "associated_info": dict(info) if isinstance(info, dict) else {},
     }
 
@@ -701,6 +772,24 @@ def _group_identity_summary(observations: list[dict[str, Any]]) -> tuple[list[st
     return all_keys, "partial_identity_order", 0.65
 
 
+def _pick_shared_field(
+    best: Any, best_is_owner: bool, cand: Any, cand_is_owner: bool
+) -> tuple[Any, bool]:
+    """Choose between two reads of a SHARED field (collected from every camera).
+
+    Higher confidence wins; within SHARED_FIELD_CONF_TIE_EPS a role-owner read (e.g.
+    the back camera for truck_number) wins the tie."""
+    if best is None:
+        return cand, cand_is_owner
+    bc = _field_conf(best)
+    cc = _field_conf(cand)
+    if abs(cc - bc) <= SHARED_FIELD_CONF_TIE_EPS:
+        if cand_is_owner and not best_is_owner:
+            return cand, True
+        return best, best_is_owner
+    return (cand, cand_is_owner) if cc > bc else (best, best_is_owner)
+
+
 def _merge_truck_group(
     entity_id: int,
     observations: list[dict[str, Any]],
@@ -783,16 +872,37 @@ def _merge_truck_group(
     # confidence.  Fields with no owner (or whose owners read nothing) fall back
     # to a normal best-of-all-cameras merge.
     for field in OCR_FIELD_KEYS:
+        owners = (
+            {cam for cam, fields in camera_roles.items() if field in fields}
+            if camera_roles else set()
+        )
+        # Shared fields (e.g. truck_number / truck_company): collect from EVERY
+        # camera and keep the highest-confidence read, with the role-owner (back)
+        # winning ties — instead of taking it exclusively from the owner. Only
+        # diverges from the exclusive path when an owner is configured.
+        if field in MULTI_CAMERA_SHARED_FIELDS and owners:
+            best: Any = None
+            best_is_owner = False
+            for obs in observations:
+                info = obs["truck"].get("associated_info") or {}
+                cand = info.get(field)
+                text = _field_text(cand)
+                if not text or _text_quality(text) == 0:
+                    continue
+                best, best_is_owner = _pick_shared_field(
+                    best, best_is_owner, cand, obs["camera"] in owners
+                )
+            if best is not None:
+                merged_info[field] = best
+            continue
         candidates = observations
-        if camera_roles:
-            owners = {cam for cam, fields in camera_roles.items() if field in fields}
-            if owners:
-                auth = [o for o in observations if o["camera"] in owners]
-                if any(
-                    _field_text((o["truck"].get("associated_info") or {}).get(field))
-                    for o in auth
-                ):
-                    candidates = auth
+        if owners:
+            auth = [o for o in observations if o["camera"] in owners]
+            if any(
+                _field_text((o["truck"].get("associated_info") or {}).get(field))
+                for o in auth
+            ):
+                candidates = auth
         for obs in candidates:
             info = obs["truck"].get("associated_info") or {}
             merged_info[field] = _better_field(merged_info.get(field), info.get(field))
@@ -880,6 +990,21 @@ def _merge_truck_group(
         },
         "source_track_ids": source_track_ids,
     }
+    # Lane the truck occupied ("detected from lane N"). Majority vote of the per-camera
+    # lane readings; only front-facing/gate cameras own lanes. Stored under
+    # associated_info["_lane"] (persists via DB) and surfaced top-level for the UI.
+    lane_votes: dict[int, int] = {}
+    for obs in observations:
+        if _camera_role_kind(obs["camera"]) == "back":
+            continue
+        truck = obs["truck"]
+        ln = truck.get("lane")
+        if ln is None:
+            ln = (truck.get("associated_info") or {}).get("_lane")
+        if ln is not None:
+            lane_votes[int(ln)] = lane_votes.get(int(ln), 0) + 1
+    merged_lane = max(lane_votes, key=lambda k: lane_votes[k]) if lane_votes else None
+    merged_info["_lane"] = merged_lane
     preferred_type = (
         "truck_with_container"
         if "truck_with_container" in truck_types
@@ -906,6 +1031,7 @@ def _merge_truck_group(
         "type": preferred_type,
         "camera": camera_label,
         "cameras": contributing_cameras,
+        "lane": merged_lane,
         "first_seen_frame": min(first_frames) if first_frames else None,
         "last_seen_frame": max(last_frames) if last_frames else None,
         "first_seen_time_sec": first_t,
@@ -938,6 +1064,8 @@ def _truck_info_to_dict(key: str, truck: Any) -> dict[str, Any]:
         "duration_sec": truck.duration_sec,
         "confidence_avg": truck.confidence_avg,
         "last_bbox": truck.last_bbox,
+        "union_bbox": getattr(truck, "union_bbox", None),
+        "lane": getattr(truck, "lane", None) if getattr(truck, "lane", None) is not None else (truck.associated_info or {}).get("_lane"),
         "associated_info": dict(truck.associated_info or {}),
     }
 
@@ -1382,6 +1510,7 @@ def _derive_camera_sessions(
             "fps": round(fps, 2) if fps else None,
             "total_frames": total,
             "processed_duration_sec": duration,
+            "resolution": session.get("resolution"),
             "model": session.get("model"),
         }
         if start_dt is not None:
@@ -1392,6 +1521,14 @@ def _derive_camera_sessions(
         reference = starts.get("front") or min(starts.values())
         for camera, start_dt in starts.items():
             offsets[camera] = round((start_dt - reference).total_seconds(), 3)
+    # Back cameras lag the front cameras by a fixed amount (trucks reach the
+    # interior camera ~BACK_EXTRA_OFFSET_S after leaving the gate). Add it on top
+    # of any NVR-derived offset so back tracks line up with the front exit they
+    # belong to. Applied unconditionally so it works even without NVR timestamps.
+    if BACK_EXTRA_OFFSET_S:
+        for camera in sessions:
+            if _camera_role_kind(camera) == "back":
+                offsets[camera] = round(offsets.get(camera, 0.0) + BACK_EXTRA_OFFSET_S, 3)
     for camera in sessions:
         sessions[camera]["time_offset_sec"] = offsets.get(camera, 0.0)
     return sessions, offsets
@@ -1423,8 +1560,369 @@ def _obs_t1(obs: dict[str, Any]) -> float:
         return _obs_t0(obs)
 
 
+def _camera_frame_width(camera: str, sessions: dict[str, dict[str, Any]] | None) -> int:
+    """Frame width (px) for a camera, parsed from its 'WxH' resolution; falls back
+    to DEFAULT_FRAME_WIDTH when unknown."""
+    sess = (sessions or {}).get(camera) or {}
+    res = sess.get("resolution")
+    if isinstance(res, str) and "x" in res.lower():
+        try:
+            return int(res.lower().split("x", 1)[0])
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_FRAME_WIDTH
+
+
+def _norm_center_x(obs: dict[str, Any]) -> float | None:
+    """Normalized (0..1) horizontal centre of an observation's bbox, mirrored for
+    cameras flagged 'flip'. None when no usable bbox is available."""
+    truck = obs.get("truck") or {}
+    bbox = truck.get("union_bbox") or truck.get("last_bbox")
+    frame_w = obs.get("frame_w") or DEFAULT_FRAME_WIDTH
+    if not bbox or len(bbox) < 4 or not frame_w:
+        return None
+    try:
+        cx = (float(bbox[0]) + float(bbox[2])) / 2.0 / float(frame_w)
+    except (TypeError, ValueError):
+        return None
+    cx = max(0.0, min(1.0, cx))
+    if (obs.get("camera") or "").lower() in CAMERA_ORIENTATION_FLIP:
+        cx = 1.0 - cx
+    return cx
+
+
+def _group_burst_by_camera(burst: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    by_cam: dict[str, list[dict[str, Any]]] = {}
+    for obs in burst:
+        by_cam.setdefault(obs["camera"], []).append(obs)
+    return by_cam
+
+
+def _cluster_centerx(obs_list: list[dict[str, Any]]) -> list[float]:
+    """Cluster observations by normalized centre-x; returns sorted cluster centres.
+    Two centres within SIDE_BY_SIDE_MIN_CENTERX_GAP belong to one cluster (one lane)."""
+    cxs = sorted(cx for cx in (_norm_center_x(o) for o in obs_list) if cx is not None)
+    if not cxs:
+        return []
+    clusters: list[list[float]] = [[cxs[0]]]
+    for x in cxs[1:]:
+        if x - clusters[-1][-1] <= SIDE_BY_SIDE_MIN_CENTERX_GAP:
+            clusters[-1].append(x)
+        else:
+            clusters.append([x])
+    return [sum(c) / len(c) for c in clusters]
+
+
+def _burst_has_side_by_side(burst: list[dict[str, Any]]) -> bool:
+    """True when a single camera sees two trucks at once: two time-overlapping tracks
+    whose normalized centre-x differ enough to be distinct lanes."""
+    for obs_list in _group_burst_by_camera(burst).values():
+        for i in range(len(obs_list)):
+            for j in range(i + 1, len(obs_list)):
+                _, ratio = _temporal_overlap_info(obs_list[i], obs_list[j])
+                ci = _norm_center_x(obs_list[i])
+                cj = _norm_center_x(obs_list[j])
+                if (
+                    ratio >= SIDE_BY_SIDE_MIN_OVERLAP_RATIO
+                    and ci is not None and cj is not None
+                    and abs(ci - cj) >= SIDE_BY_SIDE_MIN_CENTERX_GAP
+                ):
+                    return True
+    return False
+
+
+def _determine_lane_count(burst: list[dict[str, Any]]) -> int:
+    """Number of side-by-side trucks in a burst = the most distinct horizontal
+    clusters any single camera sees."""
+    return max(
+        (len(_cluster_centerx(obs_list)) for obs_list in _group_burst_by_camera(burst).values()),
+        default=1,
+    ) or 1
+
+
+def _split_burst_by_horizontal_lane(burst: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split a corroborated burst into N side-by-side trucks by horizontal position.
+
+    Slots are ordered left->right from the camera that sees the most lanes; every
+    observation is assigned to its nearest slot by centre-x. bbox-less observations
+    fall to slot 0 (logged). Returns [burst] unchanged when it is not a real split."""
+    n = _determine_lane_count(burst)
+    if n <= 1:
+        return [burst]
+    by_cam = _group_burst_by_camera(burst)
+    anchor = max(by_cam, key=lambda c: len(_cluster_centerx(by_cam[c])))
+    slot_centers = _cluster_centerx(by_cam[anchor])
+    if len(slot_centers) < 2:
+        return [burst]
+    slots: list[list[dict[str, Any]]] = [[] for _ in slot_centers]
+    for obs in burst:
+        cx = _norm_center_x(obs)
+        if cx is None:
+            slots[0].append(obs)
+            _mc_log(
+                f"  [SIDE-SPLIT] {obs['camera']}/T#{obs['truck'].get('track_id','?')} "
+                f"has no bbox -> slot 0"
+            )
+            continue
+        best_k, best_d = 0, abs(cx - slot_centers[0])
+        for j in range(1, len(slot_centers)):
+            d = abs(cx - slot_centers[j])
+            if d < best_d:
+                best_k, best_d = j, d
+        slots[best_k].append(obs)
+    return [s for s in slots if s]
+
+
+def _lane_center_x(members: list[dict[str, Any]]) -> float | None:
+    xs = [cx for cx in (_norm_center_x(o) for o in members) if cx is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _nearest_open_lane(
+    open_lanes: list[dict[str, Any]], burst: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Pick the open truck whose lane is horizontally nearest the burst (to route a
+    re-acquisition). Falls back to the most recently active lane when centre-x is
+    unavailable."""
+    burst_cx = _lane_center_x(burst)
+    if burst_cx is not None:
+        best: dict[str, Any] | None = None
+        best_d: float | None = None
+        for t in open_lanes:
+            lane_cx = t.get("lane_cx")
+            if lane_cx is None:
+                continue
+            d = abs(float(lane_cx) - burst_cx)
+            if best_d is None or d < best_d:
+                best, best_d = t, d
+        if best is not None:
+            return best
+    return max(open_lanes, key=lambda t: t["last_seen"])
+
+
+def _split_back_observation_by_exit(
+    back_obs: dict[str, Any],
+    exits: list[float],
+    lead_s: float,
+    window_s: float,
+) -> tuple[dict[int, dict[str, Any]], int, int]:
+    """Partition a back observation's timestamped OCR reads among front trucks by time.
+
+    The back camera runs one continuous track whose ``_ocr_history`` spans every truck
+    that dwelt in front of it.  Each distinct read (a variant entry, with its capture
+    midpoint) is routed to the front truck whose exit is NEAREST and within
+    ``[read - window_s, read + lead_s]``.  Returns ``({truck_index: back_sub_obs},
+    matched_reads, unmatched_reads)`` where each sub-observation carries only that
+    truck's reads (its ``associated_info`` fields re-picked from that subset), so the
+    downstream ``_merge_truck_group`` attributes cab fields to the right truck.
+    """
+    truck = back_obs["truck"]
+    history = (truck.get("associated_info") or {}).get("_ocr_history") or {}
+    buckets: dict[int, dict[str, dict[str, Any]]] = {}
+    matched = 0
+    unmatched = 0
+    for field, variants in history.items():
+        if not isinstance(variants, dict):
+            continue
+        for vkey, entry in variants.items():
+            if not isinstance(entry, dict):
+                continue
+            tf = entry.get("time_first_sec")
+            if tf is None:
+                continue
+            tl = entry.get("time_last_sec", tf)
+            mid = (float(tf) + float(tl)) / 2.0
+            cand = [
+                i for i, ex in enumerate(exits)
+                if (mid - window_s) <= ex <= (mid + lead_s)
+            ]
+            if not cand:
+                unmatched += 1
+                continue
+            best_i = min(cand, key=lambda i: abs(mid - exits[i]))
+            buckets.setdefault(best_i, {}).setdefault(field, {})[vkey] = entry
+            matched += 1
+
+    subs: dict[int, dict[str, Any]] = {}
+    for i, hist in buckets.items():
+        sub = copy.deepcopy(back_obs)
+        info = sub["truck"].setdefault("associated_info", {})
+        # Restrict this piece to only the bucketed reads, then re-pick each field's
+        # value from them (majority vote / confidence) via the existing window helper
+        # over an unbounded range (the reads are already partitioned by truck).
+        info["_ocr_history"] = copy.deepcopy(hist)
+        for f in OCR_FIELD_KEYS:
+            info[f] = None
+        _assign_ocr_fields_to_window(info, float("-inf"), float("inf"))
+        subs[i] = sub
+    return subs, matched, unmatched
+
+
+def _split_obs_across_confirmed(
+    obs: dict[str, Any], confirmed: list[Any]
+) -> list[dict[str, Any]]:
+    """Split one front observation whose (camera, perm_id) belongs to MORE THAN ONE
+    confirmed truck (the residual id-68 case where the single-camera engine merged two
+    side-by-side trucks into one id, but the supervisor re-split them from per-frame
+    boxes).
+
+    The pieces are cut proportionally along the observation's OWN time window in the
+    order of the confirmed trucks' entry times, and each piece's OCR fields are
+    re-attributed to its slice via the timestamped ``_ocr_history`` (so a plate read
+    for the second truck never leaks onto the first). Returned aligned to ``confirmed``.
+    """
+    order = sorted(range(len(confirmed)), key=lambda k: confirmed[k].entry_time)
+    durations = [max(confirmed[k].exit_time - confirmed[k].entry_time, 1e-6) for k in order]
+    total = sum(durations) or 1.0
+    o_start, o_end = _obs_t0(obs), _obs_t1(obs)
+    span = max(o_end - o_start, 0.0)
+
+    pieces: dict[int, dict[str, Any]] = {}
+    acc = 0.0
+    for k, dur in zip(order, durations):
+        seg_start = o_start + span * (acc / total)
+        acc += dur
+        seg_end = o_start + span * (acc / total)
+        piece = copy.deepcopy(obs)
+        piece["truck"]["first_seen_time_sec"] = round(seg_start, 3)
+        piece["truck"]["last_seen_time_sec"] = round(seg_end, 3)
+        piece["truck"]["duration_sec"] = round(max(seg_end - seg_start, 0.0), 3)
+        info = piece["truck"].get("associated_info")
+        if isinstance(info, dict):
+            _assign_ocr_fields_to_window(info, seg_start, seg_end)
+        pieces[k] = piece
+    return [pieces[k] for k in range(len(confirmed))]
+
+
+def _supervisor_front_groups(
+    front: list[dict[str, Any]],
+    frame_tracks_by_cam: dict[str, list[dict[str, Any]]],
+    fps_by_cam: dict[str, float],
+) -> list[dict[str, Any]] | None:
+    """Build front-truck groups from the supervisor's confirmed trucks.
+
+    Returns a list of ``{"members": [obs...], "last_seen": float}`` (one per confirmed
+    truck), or ``None`` to signal that the supervisor could not confirm from the logs
+    and the caller should fall back to the legacy burst sweep.
+    """
+    # Only front-facing cameras feed the supervisor.
+    front_ft = {
+        cam.lower(): rows
+        for cam, rows in frame_tracks_by_cam.items()
+        if rows and _camera_role_kind(cam) != "back"
+    }
+    if not front_ft:
+        return None
+
+    confirmed = _get_supervisor().confirm_front_trio(front_ft, fps_by_cam)
+    if not confirmed:
+        _mc_log("[SUPERVISOR] no trucks confirmed from per-frame logs — using legacy sweep")
+        return None
+
+    # (camera, perm_id) -> indices of confirmed trucks that claim it.
+    perm_map: dict[tuple[str, int], list[int]] = {}
+    for idx, ct in enumerate(confirmed):
+        for cam, mems in ct.members.items():
+            for m in mems:
+                pids = m.get("perm_ids") or ([m["perm_id"]] if m.get("perm_id") is not None else [])
+                for pid in pids:
+                    perm_map.setdefault((cam.lower(), int(pid)), []).append(idx)
+
+    groups: list[dict[str, Any]] = [
+        {"members": [], "last_seen": ct.exit_time, "confirmed": ct} for ct in confirmed
+    ]
+    sup_log = get_supervisor_logger()
+    mapped = 0
+    for obs in front:
+        cam = (obs.get("camera") or "").lower()
+        tid = _safe_int(obs["truck"].get("track_id"))
+        idxs = perm_map.get((cam, tid), []) if tid is not None else []
+        if not idxs:
+            sup_log.info(
+                "[REJECTED] %s/T#%s [%.2fs-%.2fs] not part of any confirmed truck "
+                "(no front-trio agreement) — dropped from consolidation",
+                cam, obs["truck"].get("track_id"), _obs_t0(obs), _obs_t1(obs),
+            )
+            continue
+        if len(idxs) == 1:
+            groups[idxs[0]]["members"].append(obs)
+            mapped += 1
+        else:
+            pieces = _split_obs_across_confirmed(obs, [confirmed[i] for i in idxs])
+            for i, piece in zip(idxs, pieces):
+                groups[i]["members"].append(piece)
+            mapped += 1
+
+    if mapped == 0:
+        # Confirmed trucks exist but no front record lined up with them (e.g. perm ids
+        # did not survive to the final records) — safer to fall back than to drop all.
+        _mc_log("[SUPERVISOR] confirmed trucks did not map to any front record — using legacy sweep")
+        return None
+
+    # Front exit = last frame any front-trio track of this truck was active.
+    for g in groups:
+        ends = [_obs_t1(o) for o in g["members"]]
+        if ends:
+            g["last_seen"] = max(ends)
+    return groups
+
+
+def _supervisor_attach_back(
+    trucks: list[dict[str, Any]], back: list[dict[str, Any]]
+) -> None:
+    """Step 3 — attach the back camera to each confirmed truck.
+
+    A back track/read joins a truck ONLY when it falls in ``[exit, exit + BACK_WINDOW_S]``
+    after that truck's front-trio exit (nearest exit wins). Back supplies only its
+    role-owned fields (truck number / company, highest confidence) during the field
+    merge; everything else — that it is a truck, the with/without-container class, and
+    timing — comes from the agreeing front trio. Outcomes are written to the supervisor
+    log. Implemented here in the consolidation layer, NOT in the supervisor.
+    """
+    sup_log = get_supervisor_logger()
+    window = SUPERVISOR_BACK_WINDOW_S
+    exits = [t["last_seen"] for t in trucks]
+    for b in sorted(back, key=_obs_t0):
+        b_t0 = _obs_t0(b)
+        b_label = f"{b['camera']}/T#{b['truck'].get('track_id', '?')} @{b_t0:.2f}s"
+        history = (b["truck"].get("associated_info") or {}).get("_ocr_history") or {}
+        # Time-routed attach: one continuous back track can feed several trucks, each
+        # read going to the truck whose exit is within [read - window, read] (i.e.
+        # exit <= read <= exit + window).
+        if BACK_ATTACH_BY_TIME and history and exits:
+            subs, _matched, unmatched = _split_back_observation_by_exit(b, exits, 0.0, window)
+            if subs:
+                for i, sub in subs.items():
+                    trucks[i]["members"].append(sub)
+                    sup_log.info(
+                        "[BACK-ATTACH] %s reads -> truck %d (front exit %.2fs, within %.0fs window)",
+                        b_label, i + 1, exits[i], window,
+                    )
+                if unmatched:
+                    sup_log.info(
+                        "[BACK-NONE] %s: %d read(s) outside every [exit, exit+%.0fs] window (dropped)",
+                        b_label, unmatched, window,
+                    )
+                continue
+        candidates = [i for i, ex in enumerate(exits) if ex <= b_t0 <= ex + window]
+        if not candidates:
+            sup_log.info(
+                "[BACK-NONE] %s -> no truck exited within the prior %.0fs (no back within %.0fs)",
+                b_label, window, window,
+            )
+            continue
+        best = min(candidates, key=lambda i: b_t0 - exits[i])
+        trucks[best]["members"].append(b)
+        sup_log.info(
+            "[BACK-ATTACH] %s -> truck %d (front exit %.2fs, within %.0fs window)",
+            b_label, best + 1, exits[best], window,
+        )
+
+
 def _group_observations_by_gate_sweep(
     observations: list[dict[str, Any]],
+    frame_tracks_by_cam: dict[str, list[dict[str, Any]]] | None = None,
+    fps_by_cam: dict[str, float] | None = None,
 ) -> list[list[dict[str, Any]]]:
     """Time-synchronized cross-camera consolidation — one group == one physical truck.
 
@@ -1460,6 +1958,17 @@ def _group_observations_by_gate_sweep(
             # Unknown cameras are treated as front-facing so they still corroborate.
             front.append(obs)
 
+    # ── Supervisor path ───────────────────────────────────────────────────────
+    # When per-frame front-trio logs are available, the supervisor camera is the
+    # authority for front confirmation + the distinct-coordinates rule; this layer
+    # then only has to attach the back camera (step 3). Falls back to the legacy
+    # burst sweep below when the supervisor can't confirm from the logs.
+    if SUPERVISOR_ENABLED and frame_tracks_by_cam:
+        sup_trucks = _supervisor_front_groups(front, frame_tracks_by_cam, fps_by_cam or {})
+        if sup_trucks is not None:
+            _supervisor_attach_back(sup_trucks, back)
+            return [t["members"] for t in sup_trucks if t["members"]]
+
     starts = sorted(front, key=_obs_t0)
     _mc_log(
         f"[GATE-SWEEP] front_starts={len(starts)} back_tracks={len(back)} "
@@ -1476,39 +1985,85 @@ def _group_observations_by_gate_sweep(
             bursts.append([obs])
 
     trucks: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
+    open_lanes: list[dict[str, Any]] = []  # trucks opened by the most recent entry
     for burst in bursts:
         b_t0 = _obs_t0(burst[0])
         b_t1 = max(_obs_t1(o) for o in burst)
         distinct_cams = {o["camera"] for o in burst}
         corroborated = len(distinct_cams) >= MIN_START_SUPPORT
         burst_label = ", ".join(f"{o['camera']}/T#{o['truck'].get('track_id','?')}" for o in burst)
-        # Absorb (re-acquisition/split) only when there IS an open truck, the burst is
-        # NOT a corroborated fresh entry, and it is within the new-truck gap of it.
-        if current is not None and not corroborated and (b_t0 - current["last_seen"]) <= NEW_TRUCK_GAP_S:
-            current["members"].extend(burst)
-            current["last_seen"] = max(current["last_seen"], b_t1)
-            _mc_log(f"  [ABSORB] truck {len(trucks)} <- [{burst_label}] (re-acquisition/split)")
+        last_activity = max((t["last_seen"] for t in open_lanes), default=None)
+        # Absorb (re-acquisition/split) only when there ARE open trucks, the burst is
+        # NOT a corroborated fresh entry, and it is within the new-truck gap. Route it
+        # to the open lane whose horizontal position is nearest, so a re-acquired
+        # side-by-side track rejoins its own lane (not the neighbour).
+        if (
+            open_lanes and not corroborated and last_activity is not None
+            and (b_t0 - last_activity) <= NEW_TRUCK_GAP_S
+        ):
+            target = _nearest_open_lane(open_lanes, burst)
+            target["members"].extend(burst)
+            target["last_seen"] = max(target["last_seen"], b_t1)
+            _mc_log(f"  [ABSORB] truck {trucks.index(target) + 1} <- [{burst_label}] (re-acquisition/split)")
+            continue
+        # Fresh entry. A corroborated burst that shows trucks side-by-side opens one
+        # truck per lane (left->right); otherwise a single truck.
+        sub_bursts = [burst]
+        if MULTI_CAMERA_SIDE_BY_SIDE_SPLIT and corroborated and _burst_has_side_by_side(burst):
+            sub_bursts = _split_burst_by_horizontal_lane(burst)
+        if not open_lanes:
+            reason = "first entry"
+        elif corroborated:
+            reason = f"corroborated by {sorted(distinct_cams)}"
         else:
-            if current is None:
-                reason = "first entry"
-            elif corroborated:
-                reason = f"corroborated by {sorted(distinct_cams)}"
-            else:
-                reason = f"gap {b_t0 - current['last_seen']:.2f}s > {NEW_TRUCK_GAP_S}s"
-            current = {"entry_t": b_t0, "last_seen": b_t1, "members": list(burst)}
-            trucks.append(current)
-            _mc_log(f"  [ENTRY] truck {len(trucks)} @{b_t0:.2f}s <- [{burst_label}] ({reason})")
+            gap = b_t0 - last_activity if last_activity is not None else 0.0
+            reason = f"gap {gap:.2f}s > {NEW_TRUCK_GAP_S}s"
+        open_lanes = []
+        for sub in sub_bursts:
+            s_t0 = min(_obs_t0(o) for o in sub)
+            s_t1 = max(_obs_t1(o) for o in sub)
+            sub_label = ", ".join(f"{o['camera']}/T#{o['truck'].get('track_id','?')}" for o in sub)
+            lane = {"entry_t": s_t0, "last_seen": s_t1, "members": list(sub), "lane_cx": _lane_center_x(sub)}
+            trucks.append(lane)
+            open_lanes.append(lane)
+            lane_note = (
+                f" lane@{lane['lane_cx']:.2f}"
+                if len(sub_bursts) > 1 and lane["lane_cx"] is not None else ""
+            )
+            _mc_log(f"  [ENTRY] truck {len(trucks)} @{s_t0:.2f}s <- [{sub_label}] ({reason}{lane_note})")
 
-    # Step 5 — back attaches only on deactivation; nearest exit wins, one truck each.
+    # Step 5 — back attaches only on deactivation. With BACK_ATTACH_BY_TIME, each
+    # timestamped back read is routed to the nearest deactivated truck (so one
+    # continuous back track feeds truck_number/company to several trucks); otherwise the
+    # whole back track attaches to the single nearest exit. A back track with no
+    # timestamped OCR history always falls back to the whole-track attach.
     exits = [t["last_seen"] for t in trucks]
     for b in sorted(back, key=_obs_t0):
         b_t0 = _obs_t0(b)
+        b_label = f"{b['camera']}/T#{b['truck'].get('track_id','?')} @{b_t0:.2f}s"
+        history = (b["truck"].get("associated_info") or {}).get("_ocr_history") or {}
+        if BACK_ATTACH_BY_TIME and history and exits:
+            subs, _matched, unmatched = _split_back_observation_by_exit(
+                b, exits, BACK_ATTACH_LEAD_S, BACK_ATTACH_WINDOW_S
+            )
+            if subs:
+                for i, sub in subs.items():
+                    trucks[i]["members"].append(sub)
+                    _mc_log(
+                        f"  [BACK-ATTACH-TIME] {b_label}: reads -> truck {i + 1} "
+                        f"(exit {exits[i]:.2f}s)"
+                    )
+                if unmatched:
+                    _mc_log(
+                        f"  [BACK-ORPHAN] {b_label}: {unmatched} read(s) outside every "
+                        f"attach window (dropped)"
+                    )
+                continue
+            # History present but no read matched any exit window → fall through.
         candidates = [
             i for i, exit_t in enumerate(exits)
             if (b_t0 - BACK_ATTACH_WINDOW_S) <= exit_t <= (b_t0 + BACK_ATTACH_LEAD_S)
         ]
-        b_label = f"{b['camera']}/T#{b['truck'].get('track_id','?')} @{b_t0:.2f}s"
         if not candidates:
             _mc_log(f"  [BACK-ORPHAN] {b_label} -> no truck deactivated in window (not spawned)")
             continue
@@ -1554,6 +2109,49 @@ def _apply_front_facing_main_class(entity: dict[str, Any], group: list[dict[str,
         entity["type"] = "truck_with_container" if "truck_with_container" in types else types[0]
 
 
+def _apply_second_container_as_side(entity: dict[str, Any]) -> None:
+    """If a truck yielded two DISTINCT container_number reads, keep the best as
+    container_number and put the next distinct value into container_side_no — only
+    when container_side_no is currently empty.
+
+    Distinctness uses the cleaned identifier so spacing/case noise (e.g.
+    'ABCD1234567' vs 'ABCD 1234567') is NOT counted as a second container."""
+    info = entity.get("associated_info")
+    if not isinstance(info, dict):
+        return
+    if _field_text(info.get("container_side_no")):
+        return  # an earlier stage / real side-number read already populated it
+    hist = (info.get("_ocr_history") or {}).get("container_number")
+    if not isinstance(hist, dict):
+        return
+    by_value: dict[str, tuple[dict[str, Any], tuple[int, float]]] = {}
+    for entry in hist.values():
+        if not isinstance(entry, dict):
+            continue
+        text = _field_text(entry)
+        if not text or _text_quality(text) == 0:
+            continue
+        cleaned = _clean_identifier(text)
+        if not cleaned:
+            continue
+        rank = (int(entry.get("count", 0) or 0), float(entry.get("confidence", 0.0) or 0.0))
+        if cleaned not in by_value or rank > by_value[cleaned][1]:
+            by_value[cleaned] = (entry, rank)
+    if len(by_value) < 2:
+        return
+    ranked = sorted(by_value.values(), key=lambda t: t[1], reverse=True)
+    secondary = ranked[1][0]
+    info["container_side_no"] = {
+        "text": secondary.get("text", ""),
+        "confidence": secondary.get("confidence", 0.0),
+        "camera": secondary.get("camera", ""),
+    }
+    _mc_log(
+        f"  [SIDE-NO] container_side_no <- 2nd container read "
+        f"'{secondary.get('text', '')}' (primary kept as container_number)"
+    )
+
+
 def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> dict[str, Any]:
     observations: list[dict[str, Any]] = []
     total_frames = 0
@@ -1561,6 +2159,9 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
     fps_values: list[float] = []
     devices: set[str] = set()
     models: set[str] = set()
+    # Per-camera, per-frame track logs + fps for the supervisor (front-trio confirmation).
+    frame_tracks_by_cam: dict[str, list[dict[str, Any]]] = {}
+    fps_by_cam: dict[str, float] = {}
 
     camera_sessions, effective_offsets = _derive_camera_sessions(camera_payloads)
     _mc_log(f"[CAMERA-SYNC] offsets(sec)={effective_offsets}  "
@@ -1578,10 +2179,14 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             frames_processed += int(session["frames_processed"])
         if session.get("video_fps") is not None:
             fps_values.append(float(session["video_fps"]))
+            fps_by_cam[camera.lower()] = float(session["video_fps"])
         if session.get("device"):
             devices.add(str(session["device"]))
         if session.get("model"):
             models.add(str(session["model"]))
+        ft = payload.get("frame_tracks")
+        if ft:
+            frame_tracks_by_cam[camera.lower()] = ft
 
         trucks = payload.get("trucks") or {}
         if not trucks:
@@ -1600,6 +2205,7 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
                 observations.append({
                     "camera": camera,
                     "truck": _apply_camera_time_offset(normalized, camera, effective_offsets),
+                    "frame_w": _camera_frame_width(camera, camera_sessions),
                 })
         else:
             # Merge re-tracked fragments within this camera before grouping
@@ -1686,7 +2292,9 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
         # camera attaches only after a truck deactivates up front. See
         # _group_observations_by_gate_sweep for the invariants.
         group_specs = []
-        for sweep_group in _group_observations_by_gate_sweep(observations):
+        for sweep_group in _group_observations_by_gate_sweep(
+            observations, frame_tracks_by_cam, fps_by_cam
+        ):
             front_cams = {g["camera"] for g in sweep_group if _camera_role_kind(g["camera"]) != "back"}
             if len(front_cams) > 1:
                 method, confidence = "gate_sweep", 0.9
@@ -1731,6 +2339,8 @@ def _merge_multi_camera_payloads(camera_payloads: dict[str, dict[str, Any]]) -> 
             # Step 6: plate by camera-preference order; main class from gate cams only.
             _apply_plate_provenance(entity, group)
             _apply_front_facing_main_class(entity, group)
+        # Step 7: a second distinct container_number read becomes the side number.
+        _apply_second_container_as_side(entity)
         merged_entities.append(entity)
 
     # Issue 7 — suppress ghost detections: an entity with NO identifying data
@@ -2265,6 +2875,14 @@ def get_multi_camera_job_status(job_id: str) -> MultiCameraAnalyzeStatusResponse
                 parsed = json.loads(data["json_snapshot"])
                 snapshots[camera] = parsed
                 job["snapshots"][camera] = parsed
+                # Write this camera's full snapshot to its own file (mirrors the
+                # single-camera local_video_log_*_snapshot.json), so each video/camera
+                # has one up-to-date JSON response on disk. Overwritten every poll.
+                try:
+                    with open(f"local_video_log_{camera}_snapshot.json", "w") as _cf:
+                        json.dump(parsed, _cf, indent=2, default=str)
+                except Exception as _e:  # noqa: BLE001 — logging must never break status
+                    print(f"  [JSON LOG] Failed to write {camera} snapshot: {_e}")
             except (TypeError, json.JSONDecodeError):
                 pass
 
@@ -2325,6 +2943,13 @@ def finalize_multi_camera_job(
         payload = data.get("result", data)
         if isinstance(payload, dict):
             camera_payloads[camera] = payload
+            # One complete per-camera result file (mirrors the single-camera
+            # local_video_log_*_final.json), so each video/camera keeps its own JSON.
+            try:
+                with open(f"local_video_log_{camera}_final.json", "w") as _cf:
+                    json.dump(payload, _cf, indent=2, default=str)
+            except Exception as _e:  # noqa: BLE001 — logging must never break finalize
+                print(f"  [JSON LOG] Failed to write {camera} final: {_e}")
 
     merged_payload = _apply_demo_constraints_to_payload(
         _merge_multi_camera_payloads(camera_payloads),

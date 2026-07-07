@@ -1,10 +1,13 @@
+
 from __future__ import annotations
+import atexit
 import random
 import io
 import json
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -70,7 +73,7 @@ OUTPUT_DIR_BACK = os.getenv(
 )
 BACK_CAMERA_LABELS = {"back", "rear"}
 CONF = _env_float("CONF", 0.73)
-TRUCK_CONF_THRESH = _env_float("TRUCK_CONF_THRESH", 0.80)
+TRUCK_CONF_THRESH = _env_float("TRUCK_CONF_THRESH", 0.90)
 IOU_THRESH = 0.50
 IOU_MERGE_THRESH = _env_float("IOU_MERGE_THRESH", 0.50)        # ← raised from 0.10
 MASK_ALPHA = 0.65
@@ -87,16 +90,74 @@ USE_HALF = True
 OCR_WORKERS = 6
 SAVE_CROPS = False
 SAVE_DETECTION_CROPS = _env_bool("SAVE_DETECTION_CROPS", True)
+# Emit a per-camera, per-frame truck-track log inside the job result (key
+# "frame_tracks"). This is the per-frame view the cross-camera supervisor consumes to
+# confirm the front trio and apply the distinct-coordinates rule. It records ONLY
+# truck-class detections and is included in the FINAL result only (never in the
+# progress snapshots), so it does not bloat status polling. Set EMIT_FRAME_TRACKS=0 to
+# disable (the supervisor then transparently falls back to the coarser sweep).
+EMIT_FRAME_TRACKS = _env_bool("EMIT_FRAME_TRACKS", True)
 MIN_ASSOC_SCORE = 0.60
 
 # ================ FIX: Lowered area thresholds ===============================
-MIN_TRUCK_AREA = _env_int("MIN_TRUCK_AREA", 15000)           # was 40000
-MIN_TRUCK_TRACK_FRAMES = _env_int("MIN_TRUCK_TRACK_FRAMES", 10)
+MIN_TRUCK_AREA = _env_int("MIN_TRUCK_AREA", 10000)           # was 40000
+MIN_TRUCK_TRACK_FRAMES = _env_int("MIN_TRUCK_TRACK_FRAMES", 250)
 MIN_TRUCK_MASK_AREA = _env_float("MIN_TRUCK_MASK_AREA", 10000)  # lowered accordingly
 
 JSON_SNAP_EVERY = 10
 OCR_RETRY_EVERY = 45
 LOCK_AFTER_N_FRAMES = 5
+
+# ── Per-(field, truck-id) OCR capture budget ─────────────────────────────────
+# Sample at least this many crops per field per truck so the majority vote is
+# solid; the budget resets when a NEW main-class truck id is minted (so a later
+# truck never clobbers an earlier truck's reads). While still empty + active, a
+# field keeps sampling up to OCR_FRAMES_PER_FIELD * the ceiling below.
+OCR_FRAMES_PER_FIELD = _env_int("OCR_FRAMES_PER_FIELD", 10)
+OCR_SAMPLE_STRIDE = _env_int("OCR_SAMPLE_STRIDE", 1)   # min frames between crops per (field, truck)
+OCR_BUDGET_CEILING_MULT = _env_int("OCR_BUDGET_CEILING_MULT", 2)  # hard stop for a still-empty field
+
+# ── MinerU OCR call resilience (config via env) ──────────────────────────────
+MINERU_MAX_RETRIES = _env_int("MINERU_MAX_RETRIES", 3)
+MINERU_BACKOFF_BASE = _env_float("MINERU_BACKOFF_BASE", 2.0)
+MINERU_BACKOFF_MAX = _env_float("MINERU_BACKOFF_MAX", 20.0)
+MINERU_POLL_TRIES = _env_int("MINERU_POLL_TRIES", 20)
+MINERU_POLL_INTERVAL = _env_float("MINERU_POLL_INTERVAL", 3.0)
+MINERU_STEP_TIMEOUT = _env_int("MINERU_STEP_TIMEOUT", 15)
+
+# ── PaddleOCR GPU fallback (config via env) ──────────────────────────────────
+# When a MinerU read fails (network timeout/error) OR comes back empty, the crop
+# is retried on a LOCAL PaddleOCR engine running on the GPU (RTX 3060), so reads
+# keep flowing when the cloud OCR is flaky or the box is offline.
+#
+# WHY A SEPARATE PROCESS: this process loads PyTorch (YOLO) built against CUDA,
+# and paddlepaddle-gpu ships the SAME cuDNN/cuBLAS DLL names at incompatible
+# versions — on Windows only one copy per name can load, so whichever framework
+# initializes second dies with "WinError 127 … cudnn_cnn64_9.dll". So PaddleOCR
+# runs in its own venv (backend/.venv_ocr, where torch is CPU-only) as a tiny
+# localhost HTTP worker; we POST crops to it. The worker is spawned lazily on the
+# first fallback need — MinerU-only deployments never start it. If the worker venv
+# is absent or the worker can't start, the fallback degrades to a no-op (reads
+# just stay empty, exactly as MinerU-only). Set PADDLE_OCR_FALLBACK=0 to disable.
+PADDLE_OCR_FALLBACK = _env_bool("PADDLE_OCR_FALLBACK", True)
+# Use the LOCAL GPU PaddleOCR as the PRIMARY engine (fast, ~ms), with the MinerU
+# cloud as the fallback when Paddle yields nothing. This is what makes raw reads
+# stream to the frontend DURING the run instead of bunching up behind slow cloud
+# round-trips. Set PADDLE_OCR_PRIMARY=0 to restore the old MinerU-first order.
+PADDLE_OCR_PRIMARY = _env_bool("PADDLE_OCR_PRIMARY", True)
+PADDLE_OCR_DEVICE = os.getenv("PADDLE_OCR_DEVICE", "gpu")  # worker device: "gpu" or "cpu"
+PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "en")
+
+# GPU OCR worker process (see backend/ocr_gpu_worker.py).
+_BACKEND_DIR = Path(__file__).resolve().parent
+OCR_WORKER_HOST = os.getenv("OCR_GPU_WORKER_HOST", "127.0.0.1")
+OCR_WORKER_PORT = _env_int("OCR_GPU_WORKER_PORT", 8899)
+OCR_WORKER_PYTHON = os.getenv(
+    "OCR_GPU_WORKER_PYTHON", str(_BACKEND_DIR / ".venv_ocr" / "Scripts" / "python.exe")
+)
+OCR_WORKER_SCRIPT = os.getenv("OCR_GPU_WORKER_SCRIPT", str(_BACKEND_DIR / "ocr_gpu_worker.py"))
+OCR_WORKER_STARTUP_TIMEOUT = _env_float("OCR_GPU_WORKER_STARTUP_TIMEOUT", 120.0)
+OCR_WORKER_REQUEST_TIMEOUT = _env_float("OCR_GPU_WORKER_REQUEST_TIMEOUT", 30.0)
 
 # ================ FIX: Greatly reduced active window and raised IoU thresholds
 ACTIVE_WINDOW_FRAMES = _env_int("ACTIVE_WINDOW_FRAMES", 60)      # was 600
@@ -106,6 +167,34 @@ HIGH_IOU_MERGE_THRESH = _env_float("HIGH_IOU_MERGE_THRESH", 0.95) # was 0.50
 # (e.g. a 2-min truck and a 7-min truck both driving through the same gate lane).
 # Default: 150 frames = 5 s at 30 fps.  Set MIN_INTER_TRUCK_GAP_FRAMES=0 to disable.
 MIN_INTER_TRUCK_GAP_FRAMES = _env_int("MIN_INTER_TRUCK_GAP_FRAMES", 150)
+
+# ── Concurrent-truck separation by position (generic, no ROI/lanes) ──────────
+# At most two trucks are ever in frame at once. When two are detected AT THE SAME TIME
+# but at different coordinates they must stay on SEPARATE permanent ids — even when
+# their boxes overlap (a near truck's large box can contain a farther truck's box, so
+# overlap alone is not enough). Rule: two CONCURRENT detections whose bbox centres
+# differ by more than TRUCK_SEP_FRAC of the frame width/height in EITHER axis are
+# different physical trucks and are never merged. Purely geometric — no ROI, lanes, or
+# drawing. Lower TRUCK_SEP_FRAC if two nearby trucks still merge; raise it if one truck
+# is split in two. "Concurrent" = the candidate truck was seen within
+# TRUCK_CONCURRENT_FRAMES frames (a truck that left long ago never blocks a new id).
+# Set TRUCK_SEP_FRAC=0 to disable.
+TRUCK_SEP_FRAC = _env_float("TRUCK_SEP_FRAC", 0.10)
+TRUCK_CONCURRENT_FRAMES = _env_int("TRUCK_CONCURRENT_FRAMES", 15)
+
+# ── Appearance-based split (ReID) ────────────────────────────────────────────
+# When trucks stop at the SAME gate spot one after another, their boxes overlap over
+# time so the tracker keeps ONE id (position/IoU can't tell them apart). This splits by
+# APPEARANCE: each permanent id keeps a running colour signature (HSV histogram) of its
+# crop; when a detection kept on that id looks too DIFFERENT for APPEARANCE_SPLIT_PATIENCE
+# consecutive frames (histogram correlation < APPEARANCE_MATCH_THRESH), it is a new
+# physical truck and gets a fresh id. Generic — no ROI/lines/times. Tune on real footage:
+# lower APPEARANCE_MATCH_THRESH if one truck is being split; raise it if two different
+# trucks still share an id. Set APPEARANCE_SPLIT=0 to disable.
+APPEARANCE_SPLIT = _env_bool("APPEARANCE_SPLIT", True)
+APPEARANCE_MATCH_THRESH = _env_float("APPEARANCE_MATCH_THRESH", 0.35)
+APPEARANCE_SPLIT_PATIENCE = _env_int("APPEARANCE_SPLIT_PATIENCE", 5)
+APPEARANCE_MIN_CROP = _env_int("APPEARANCE_MIN_CROP", 60)  # skip crops smaller than this (unreliable)
 
 # ========================= PER-CAMERA DETECTION STATS =======================
 @dataclass
@@ -224,7 +313,7 @@ with open(_TRACKER_CFG_PATH, "w") as _f:
         "track_high_thresh: 0.60\n"
         "track_low_thresh: 0.33\n"
         "new_track_thresh: 0.50\n"
-        "track_buffer: 120\n"           # was 90 – 4 seconds at 30 fps
+        "track_buffer: 60\n"            # 2 s at 30 fps (was 500 = 16 s, which glued trucks)
         "match_thresh: 0.55\n"          # was 0.60 – easier re‑association
         "fuse_score: True\n"
     )
@@ -330,8 +419,18 @@ class VideoJob:
     raw_to_perm_id: dict[int, int] = field(default_factory=dict)
     _next_perm_id: int = 1
     ocr_best_conf: dict[tuple[str, int], float] = field(default_factory=dict)
+    # Per-(field, owner) OCR capture budget: how many crops we have enqueued, and
+    # the last frame we enqueued one (for stride). owner = truck_tid once known,
+    # else the raw child track_id (transferred to the truck on lock).
+    ocr_field_count: dict[tuple[str, int], int] = field(default_factory=dict)
+    ocr_field_last_frame: dict[tuple[str, int], int] = field(default_factory=dict)
     orphan_buffer: list[dict[str, Any]] = field(default_factory=list)
     camera_source: str = ""
+    # Appearance (ReID) split state. perm_appearance: perm id -> running HSV colour
+    # signature of its crop. appearance_divergence: raw track id -> consecutive frames
+    # its crop has looked different from its perm's signature (split when it persists).
+    perm_appearance: dict[int, Any] = field(default_factory=dict)
+    appearance_divergence: dict[int, int] = field(default_factory=dict)
 
 JOBS: dict[str, VideoJob] = {}
 
@@ -360,6 +459,28 @@ def _containment(child: tuple[int, int, int, int], parent: tuple[int, int, int, 
         return 0.0
     child_area = (child[2] - child[0]) * (child[3] - child[1])
     return (i_w * i_h) / child_area if child_area > 0 else 0.0
+
+def _bbox_centroid(box: tuple[int, int, int, int]) -> tuple[float, float]:
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+def _crop_hsv_sig(frame: np.ndarray, box: tuple[int, int, int, int]) -> "np.ndarray | None":
+    """Colour appearance signature of a truck crop: a normalized 2-D H×S histogram.
+    Two different trucks (different cab/container colours) have low correlation; the same
+    truck across frames stays high. Returns None for crops smaller than APPEARANCE_MIN_CROP."""
+    x1, y1, x2, y2 = box
+    if (x2 - x1) < APPEARANCE_MIN_CROP or (y2 - y1) < APPEARANCE_MIN_CROP:
+        return None
+    crop = frame[max(0, y1):y2, max(0, x1):x2]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [24, 24], [0, 180, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.flatten().astype(np.float32)
+
+def _appearance_corr(a: "np.ndarray", b: "np.ndarray") -> float:
+    """Histogram correlation in [-1, 1]; 1.0 = identical appearance."""
+    return float(cv2.compareHist(a, b, cv2.HISTCMP_CORREL))
 
 def _mask_area(mask: Any, box: tuple[int, int, int, int]) -> float:
     if mask is not None:
@@ -427,6 +548,20 @@ def _update_association_votes(
         }
         del job.child_assoc_votes[track_id]
         print(f"  [LOCKED] ✅ child T#{track_id} ({cls_name}) → Truck T#{best_key[0]} ({best_key[1]}) after majority vote")
+        # Move any pre-lock capture budget (keyed by the raw child track id, used
+        # while no truck was associated yet) onto the truck so it does not re-spend
+        # the whole per-field budget after locking.
+        with _jobs_lock:
+            src = (cls_name, track_id)
+            dst = (cls_name, best_key[0])
+            if src in job.ocr_field_count:
+                job.ocr_field_count[dst] = job.ocr_field_count.get(dst, 0) + job.ocr_field_count.pop(src)
+            if src in job.ocr_field_last_frame:
+                job.ocr_field_last_frame[dst] = max(
+                    job.ocr_field_last_frame.get(dst, -10**9), job.ocr_field_last_frame.pop(src)
+                )
+            if src in job.ocr_best_conf:
+                job.ocr_best_conf[dst] = max(job.ocr_best_conf.get(dst, 0.0), job.ocr_best_conf.pop(src))
 
 def _build_association_map_integrated(
     boxes_data: list[tuple],
@@ -490,17 +625,25 @@ def _get_perm_truck_id(
     bbox: tuple[int, int, int, int],
     registry: "TruckRegistry",
     frame_id: int,
+    sep_x: float = 0.0,
+    sep_y: float = 0.0,
 ) -> int:
     """
-    Map a raw ByteTrack ID to a stable permanent ID.
+    Map a raw ByteTrack ID to a stable permanent ID by bounding-box overlap.
 
-    FIXES:
-    - Hard merge (Path B) now requires IoU >= HIGH_IOU_MERGE_THRESH (0.95)
-      AND the existing permanent truck must have been seen within the last
-      30 frames (1 second at 30 fps).  This prevents merging a truck that
-      left long ago with a newly arriving truck.
-    - Soft merge (Path C) uses the (reduced) ACTIVE_WINDOW_FRAMES (60)
-      and the raised IOU_MERGE_THRESH (0.65).
+    No ROI / lanes / drawing. Two rules keep up to two concurrent trucks apart by their
+    coordinates:
+    1. Merging is judged on the candidate's CURRENT box (``last_bbox``) only, NOT its
+       accumulated ``union_bbox`` — so a detection that does not overlap the truck's box
+       *now* is a different object (the union once spanned the whole frame and glued a
+       far-corner box on).
+    2. 2D-position guard: a CONCURRENT candidate (seen within TRUCK_CONCURRENT_FRAMES)
+       whose bbox centre differs from this detection by more than (sep_x, sep_y) in
+       EITHER axis is a different physical truck and is never merged — even if the boxes
+       overlap (a near truck's big box can contain a farther truck's box).
+    - Hard merge (Path B): IoU >= HIGH_IOU_MERGE_THRESH and the existing truck was
+      seen within the last ~100 frames (prevents merging a truck that left long ago).
+    - Soft merge (Path C): within ACTIVE_WINDOW_FRAMES, IoU >= IOU_MERGE_THRESH.
     """
     if raw_id in job.raw_to_perm_id:
         return job.raw_to_perm_id[raw_id]
@@ -512,15 +655,23 @@ def _get_perm_truck_id(
     best_perm_soft: int | None = None
     best_score_soft = 0.0
 
+    new_cx, new_cy = _bbox_centroid(bbox)
+
     with registry._lock:
         for perm_id, rec in registry.trucks.items():
             lb = tuple(rec["last_bbox"])
-            ub = tuple(rec["union_bbox"])
+            age = frame_id - rec.get("last_seen_frame", 0)
+            # 2D-position guard: two trucks in frame at the same time but at different
+            # coordinates must stay separate, even if their boxes overlap.
+            if (sep_x > 0 or sep_y > 0) and age <= TRUCK_CONCURRENT_FRAMES:
+                ccx, ccy = _bbox_centroid(lb)
+                if abs(new_cx - ccx) > sep_x or abs(new_cy - ccy) > sep_y:
+                    continue  # concurrent but far apart in x or y → different truck
+            # CURRENT-position overlap only (no union_bbox): a detection that does not
+            # overlap the candidate's current box is a different physical object.
             score = max(
                 _iou(bbox, lb), _containment(bbox, lb), _containment(lb, bbox),
-                _iou(bbox, ub), _containment(bbox, ub), _containment(ub, bbox),
             )
-            age = frame_id - rec.get("last_seen_frame", 0)
 
             # Path B – hard merge: extremely high IoU AND very recent
             if score >= HIGH_IOU_MERGE_THRESH:
@@ -687,6 +838,33 @@ def _consolidate_perm_ids(job: VideoJob, registry: "TruckRegistry") -> None:
     for child_tid, lock in job.child_to_truck.items():
         if lock["truck_tid"] in merged_into:
             lock["truck_tid"] = merged_into[lock["truck_tid"]]
+    # Keep the per-frame track log's perm ids consistent with the consolidated ids, so
+    # the supervisor can still bridge (camera, perm_id) -> final per-truck record.
+    with registry._lock:
+        for row in registry.frame_tracks:
+            pid = row.get("perm_id")
+            if pid in merged_into:
+                row["perm_id"] = merged_into[pid]
+    # Fold the per-field capture budgets of merged-away trucks into their primary so
+    # the budget keys stay consistent with the consolidated ids. (OCR is finished by
+    # the time consolidation runs; this is housekeeping.)
+    with _jobs_lock:
+        for (fld, owner) in list(job.ocr_field_count.keys()):
+            if owner in merged_into:
+                pk = (fld, merged_into[owner])
+                job.ocr_field_count[pk] = job.ocr_field_count.get(pk, 0) + job.ocr_field_count.pop((fld, owner))
+        for (fld, owner) in list(job.ocr_field_last_frame.keys()):
+            if owner in merged_into:
+                pk = (fld, merged_into[owner])
+                job.ocr_field_last_frame[pk] = max(
+                    job.ocr_field_last_frame.get(pk, -10**9), job.ocr_field_last_frame.pop((fld, owner))
+                )
+        for (fld, owner) in list(job.ocr_best_conf.keys()):
+            if owner in merged_into:
+                pk = (fld, merged_into[owner])
+                job.ocr_best_conf[pk] = max(
+                    job.ocr_best_conf.get(pk, 0.0), job.ocr_best_conf.pop((fld, owner))
+                )
     print(f"  [CONSOLIDATE] Done. Merged {len(merged_into)} secondary ID(s).")
 
 # ========================= TEXT QUALITY ======================================
@@ -745,6 +923,36 @@ class TruckRegistry:
         self.camera_source = camera_source
         self.trucks: dict[int, dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # Per-frame truck-class detection log (the raw-tracker view the cross-camera
+        # supervisor consumes). One row per kept truck detection per frame. Carries the
+        # RAW ByteTrack id AND this engine's permanent id, so the supervisor can both
+        # re-derive spatial splits from raw boxes and bridge to the final per-truck
+        # records (whose track_id == perm_id).
+        self.frame_tracks: list[dict[str, Any]] = []
+
+    def record_frame_track(
+        self,
+        frame_id: int,
+        raw_track_id: int | None,
+        perm_id: int | None,
+        cls_name: str,
+        conf: float,
+        bbox: tuple[int, int, int, int],
+        crop_path: str | None = None,
+    ) -> None:
+        if not EMIT_FRAME_TRACKS:
+            return
+        x1, y1, x2, y2 = bbox
+        with self._lock:
+            self.frame_tracks.append({
+                "frame_id": int(frame_id),
+                "track_id": int(raw_track_id) if raw_track_id is not None else None,
+                "perm_id": int(perm_id) if perm_id is not None else None,
+                "class_name": cls_name,
+                "confidence": round(float(conf), 4),
+                "bbox": {"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
+                "crop_path": crop_path,
+            })
 
     def _new_record(self, tid: int, cls_name: str, bbox: tuple[int, int, int, int], frame_id: int, conf: float) -> dict[str, Any]:
         return {
@@ -894,7 +1102,7 @@ class TruckRegistry:
                         best_tid = tid
             return best_tid
 
-    def to_dict(self, session_info: dict[str, Any] | None = None) -> dict[str, Any]:
+    def to_dict(self, session_info: dict[str, Any] | None = None, include_frame_tracks: bool = False) -> dict[str, Any]:
         with self._lock:
             trucks_out: dict[str, dict[str, Any]] = {}
             for tid, rec in self.trucks.items():
@@ -904,9 +1112,12 @@ class TruckRegistry:
                 clean = {k: v for k, v in rec.items() if not k.startswith("_")}
                 clean["associated_info"] = dict(rec["associated_info"])
                 trucks_out[str(tid)] = clean
+            # Snapshot the per-frame log under the same lock (final result only — callers
+            # pass include_frame_tracks=False for progress snapshots to keep them small).
+            frame_tracks = list(self.frame_tracks) if include_frame_tracks else None
         twc = sum(1 for t in trucks_out.values() if t["type"] == "truck_with_container")
         twoc = sum(1 for t in trucks_out.values() if t["type"] == "truck_without_container")
-        return {
+        out: dict[str, Any] = {
             "session": session_info or {},
             "summary": {
                 "total_trucks_tracked": len(trucks_out),
@@ -915,6 +1126,9 @@ class TruckRegistry:
             },
             "trucks": trucks_out,
         }
+        if frame_tracks is not None:
+            out["frame_tracks"] = frame_tracks
+        return out
 
 # ========================= OCR HELPERS =======================================
 def _parse_mineru_markdown(md_text: str) -> str:
@@ -1029,24 +1243,46 @@ def mineru_status(probe: bool = True) -> dict:
         "failed_calls": _mineru_stats["failed_calls"],
         "last_ok_ts": _mineru_stats["last_ok_ts"],
         "last_error": probe_error or _mineru_stats["last_error"],
+        # Local GPU PaddleOCR fallback (separate worker process) engaged when
+        # MinerU yields nothing.
+        "fallback": {
+            "provider": "PaddleOCR",
+            "enabled": PADDLE_OCR_FALLBACK,
+            "device": PADDLE_OCR_DEVICE,
+            "worker_url": _worker_base_url(),
+            "worker_ready": _worker_ready,
+            "worker_failed": _worker_failed,
+            "ok_calls": _paddle_stats["ok_calls"],
+            "failed_calls": _paddle_stats["failed_calls"],
+            "last_ok_ts": _paddle_stats["last_ok_ts"],
+            "last_error": _paddle_stats["last_error"],
+        },
     }
 
 
-def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
+def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = MINERU_MAX_RETRIES) -> tuple[str, str]:
+    """Upload a crop to MinerU and return (text, status).
+
+    status ∈ {"ok", "empty", "timeout", "failed", "error"}. A transient failure
+    (timeout/error) is distinguished from a real-but-empty/failed result so the
+    caller can decide whether the field is still worth re-submitting. Retries use
+    exponential backoff with jitter so a flaky MinerU does not stall the field."""
     if not MINERU_TOKEN:
-        return ""
+        return "", "failed"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {MINERU_TOKEN}"}
     _, enc = cv2.imencode(".png", crop_rgb)
     filename = f"crop_{uuid.uuid4().hex[:8]}.png"
     data_id = uuid.uuid4().hex
+    last_status = "error"
     for attempt in range(max_retries):
         try:
-            step1 = requests.post("https://mineru.net/api/v4/file-urls/batch", json={"files": [{"name": filename, "data_id": data_id}], "model_version": "vlm"}, headers=headers, timeout=15)
+            step1 = requests.post("https://mineru.net/api/v4/file-urls/batch", json={"files": [{"name": filename, "data_id": data_id}], "model_version": "vlm"}, headers=headers, timeout=MINERU_STEP_TIMEOUT)
             step1.raise_for_status()
             payload = step1.json()
             if payload.get("code") != 0:
                 print(f"  ⚠️ MinerU: {payload.get('msg')}")
                 _mineru_mark_fail(payload.get("msg") or "non-zero response code")
+                last_status = "failed"
                 continue
             _mineru_mark_ok()
             batch_id = payload["data"]["batch_id"]
@@ -1054,23 +1290,24 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
             put_resp = requests.put(upload_url, data=enc.tobytes(), timeout=30)
             if put_resp.status_code not in (200, 201):
                 print(f"  ⚠️ Upload failed: {put_resp.status_code}")
+                last_status = "error"
                 continue
             print(f"  [MinerU] crop uploaded ({len(enc.tobytes())} bytes) → batch {batch_id[:10]}… polling for result", flush=True)
             poll_url = f"https://mineru.net/api/v4/extract-results/batch/{batch_id}"
-            for poll_i in range(20):
-                time.sleep(3)
+            for poll_i in range(MINERU_POLL_TRIES):
+                time.sleep(MINERU_POLL_INTERVAL)
                 try:
-                    pr = requests.get(poll_url, headers=headers, timeout=15)
+                    pr = requests.get(poll_url, headers=headers, timeout=MINERU_STEP_TIMEOUT)
                     pr.raise_for_status()
                     results = pr.json().get("data", {}).get("extract_result", [])
                     if not results:
                         continue
                     state = results[0].get("state")
                     if state == "done":
-                        return _extract_md_from_zip(results[0].get("full_zip_url", ""))
+                        return _extract_md_from_zip(results[0].get("full_zip_url", "")), "ok"
                     if state == "failed":
                         print(f"  ⚠️ MinerU failed: {results[0].get('err_msg')}")
-                        return ""
+                        return "", "failed"
                 except requests.exceptions.Timeout:
                     print(f"  ⚠️ Poll #{poll_i} timed out — retrying…")
                     continue
@@ -1078,13 +1315,186 @@ def _call_mineru_ocr(crop_rgb: np.ndarray, max_retries: int = 2) -> str:
                     print(f"  ⚠️ Poll #{poll_i} error: {e}")
                     continue
             print(f"  ⚠️ MinerU: max polls reached (attempt {attempt + 1})")
+            last_status = "timeout"
         except requests.exceptions.Timeout:
             print(f"  ⚠️ MinerU S1/S2 timeout (attempt {attempt + 1}/{max_retries})")
             _mineru_mark_fail(f"timeout (attempt {attempt + 1})")
+            last_status = "timeout"
         except requests.exceptions.RequestException as e:
             print(f"  ⚠️ MinerU request error: {e} (attempt {attempt + 1}/{max_retries})")
             _mineru_mark_fail(e)
-    return ""
+            last_status = "error"
+        # Exponential backoff with jitter before the next attempt (skip after last).
+        if attempt < max_retries - 1:
+            delay = min(MINERU_BACKOFF_MAX, MINERU_BACKOFF_BASE * (2 ** attempt)) + random.uniform(0.0, 1.0)
+            time.sleep(delay)
+    return "", last_status
+
+
+# ========================= PADDLEOCR GPU FALLBACK ============================
+# PaddleOCR runs in a SEPARATE process (backend/ocr_gpu_worker.py) under its own
+# venv where torch is CPU-only, so paddlepaddle-gpu owns the GPU without clashing
+# with this process's torch-CUDA (YOLO). We POST crops to it over localhost HTTP.
+# The worker is spawned lazily on the first fallback need and reused thereafter;
+# if its venv/script is missing or it never comes up, the fallback degrades to a
+# no-op (MinerU-only), never breaking the pipeline.
+_paddle_stats = {
+    "ok_calls": 0,
+    "failed_calls": 0,
+    "last_ok_ts": None,
+    "last_error": None,
+    "last_error_ts": None,
+}
+
+_worker_lock = threading.Lock()
+_worker_proc: "subprocess.Popen | None" = None
+_worker_ready = False
+_worker_failed = False       # permanent: venv/script missing or startup timed out
+_worker_spawned_by_us = False
+
+
+def _worker_base_url() -> str:
+    return f"http://{OCR_WORKER_HOST}:{OCR_WORKER_PORT}"
+
+
+def _worker_health_ready(timeout: float = 3.0) -> bool:
+    try:
+        resp = requests.get(f"{_worker_base_url()}/health", timeout=timeout)
+        return resp.status_code == 200 and bool(resp.json().get("ready"))
+    except requests.exceptions.RequestException:
+        return False
+
+
+def _ensure_ocr_worker() -> bool:
+    """Ensure the GPU OCR worker is running and ready.
+
+    Returns False (permanently) if the fallback is disabled or the worker
+    venv/script is missing, so callers degrade to MinerU-only. Thread-safe: only
+    one thread spawns the worker; the rest wait on the lock and see it ready.
+    """
+    global _worker_proc, _worker_ready, _worker_failed, _worker_spawned_by_us
+    if not PADDLE_OCR_FALLBACK or _worker_failed:
+        return False
+    if _worker_ready:
+        return True
+    with _worker_lock:
+        if _worker_ready:
+            return True
+        if _worker_failed:
+            return False
+        # An externally-started worker (e.g. launched by the operator) wins.
+        if _worker_health_ready():
+            _worker_ready = True
+            print(f"[PlateFlow] Using existing GPU OCR worker at {_worker_base_url()}", flush=True)
+            return True
+        # Spawn one unless a previously spawned process is still warming up.
+        if _worker_proc is None or _worker_proc.poll() is not None:
+            missing = None
+            if not os.path.exists(OCR_WORKER_PYTHON):
+                missing = f"worker venv python ({OCR_WORKER_PYTHON})"
+            elif not os.path.exists(OCR_WORKER_SCRIPT):
+                missing = f"worker script ({OCR_WORKER_SCRIPT})"
+            if missing is not None:
+                _worker_failed = True
+                msg = f"GPU OCR worker unavailable: missing {missing}"
+                _paddle_stats["last_error"] = msg
+                _paddle_stats["last_error_ts"] = time.time()
+                print(f"[PlateFlow] {msg} — falling back to MinerU-only", flush=True)
+                return False
+            print(f"[PlateFlow] Spawning GPU OCR worker (port {OCR_WORKER_PORT}, device {PADDLE_OCR_DEVICE})…", flush=True)
+            try:
+                _worker_proc = subprocess.Popen(
+                    [OCR_WORKER_PYTHON, OCR_WORKER_SCRIPT,
+                     "--host", OCR_WORKER_HOST, "--port", str(OCR_WORKER_PORT),
+                     "--device", PADDLE_OCR_DEVICE, "--lang", PADDLE_OCR_LANG],
+                    cwd=str(_BACKEND_DIR),
+                )
+                _worker_spawned_by_us = True
+            except Exception as exc:  # noqa: BLE001
+                _worker_failed = True
+                _paddle_stats["last_error"] = f"spawn failed: {exc}"
+                _paddle_stats["last_error_ts"] = time.time()
+                print(f"[PlateFlow] Could not spawn GPU OCR worker: {exc}", flush=True)
+                return False
+        # Wait for readiness (model load takes ~10-20s on first start).
+        deadline = time.time() + OCR_WORKER_STARTUP_TIMEOUT
+        while time.time() < deadline:
+            if _worker_proc is not None and _worker_proc.poll() is not None:
+                _worker_failed = True
+                msg = f"GPU OCR worker exited during startup (code {_worker_proc.returncode})"
+                _paddle_stats["last_error"] = msg
+                _paddle_stats["last_error_ts"] = time.time()
+                print(f"[PlateFlow] {msg}", flush=True)
+                return False
+            if _worker_health_ready():
+                _worker_ready = True
+                print(f"[PlateFlow] GPU OCR worker ready at {_worker_base_url()}", flush=True)
+                return True
+            time.sleep(1.0)
+        _worker_failed = True
+        _paddle_stats["last_error"] = "worker startup timed out"
+        _paddle_stats["last_error_ts"] = time.time()
+        print(f"[PlateFlow] GPU OCR worker not ready in {OCR_WORKER_STARTUP_TIMEOUT:.0f}s — MinerU-only", flush=True)
+        return False
+
+
+def _call_paddle_ocr(crop_rgb: np.ndarray) -> tuple[str, str]:
+    """Run the GPU PaddleOCR fallback on a crop via the worker process.
+
+    Mirrors _call_mineru_ocr's contract: returns (text, status) with
+    status ∈ {"ok", "empty", "error"}.
+    """
+    global _worker_ready
+    if crop_rgb is None or crop_rgb.size == 0:
+        return "", "empty"
+    if not _ensure_ocr_worker():
+        return "", "error"
+    # Crop is RGB; encode a color-correct PNG (the worker decodes to BGR for paddle).
+    crop_bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+    ok, enc = cv2.imencode(".png", crop_bgr)
+    if not ok:
+        return "", "error"
+    try:
+        resp = requests.post(
+            f"{_worker_base_url()}/ocr",
+            data=enc.tobytes(),
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=OCR_WORKER_REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        text = (payload.get("text") or "").strip()
+        if text:
+            _paddle_stats["ok_calls"] += 1
+            _paddle_stats["last_ok_ts"] = time.time()
+            return text, "ok"
+        status = payload.get("status")
+        return "", status if status in ("empty", "error") else "empty"
+    except requests.exceptions.RequestException as exc:
+        # The worker may have died — force a re-check/respawn on the next call.
+        _worker_ready = False
+        _paddle_stats["failed_calls"] += 1
+        _paddle_stats["last_error"] = str(exc)
+        _paddle_stats["last_error_ts"] = time.time()
+        print(f"  ⚠️ GPU OCR worker request error: {exc}", flush=True)
+        return "", "error"
+
+
+def _shutdown_ocr_worker() -> None:
+    """Terminate the worker if WE spawned it (leave operator-started ones running)."""
+    if _worker_spawned_by_us and _worker_proc is not None and _worker_proc.poll() is None:
+        try:
+            _worker_proc.terminate()
+            try:
+                _worker_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _worker_proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(_shutdown_ocr_worker)
+
 
 # ========================= VISUAL HELPERS ====================================
 def _resize_for_inference(frame: np.ndarray) -> tuple[np.ndarray, float]:
@@ -1094,13 +1504,15 @@ def _resize_for_inference(frame: np.ndarray) -> tuple[np.ndarray, float]:
     scale = INFER_WIDTH / w
     return cv2.resize(frame, (INFER_WIDTH, int(h * scale)), interpolation=cv2.INTER_LINEAR), scale
 
-def _save_detection_crop(frame: np.ndarray, cls_name: str, frame_id: int, det_index: int, conf: float, track_id: int | None, box: tuple[int, int, int, int], detections_dir: str | None = None) -> None:
+def _save_detection_crop(frame: np.ndarray, cls_name: str, frame_id: int, det_index: int, conf: float, track_id: int | None, box: tuple[int, int, int, int], detections_dir: str | None = None) -> str | None:
+    """Persist a detection crop + metadata JSON; returns the crop image path (or None
+    when disabled/empty) so callers can record it on the per-frame track log."""
     if not SAVE_DETECTION_CROPS:
-        return
+        return None
     x1, y1, x2, y2 = box
     crop = frame[y1:y2, x1:x2].copy()
     if crop.size == 0:
-        return
+        return None
     base_dir = detections_dir or os.path.join(OUTPUT_DIR, "detections")
     safe_class = re.sub(r"[^A-Za-z0-9_.-]", "_", cls_name)
     class_dir = os.path.join(base_dir, safe_class)
@@ -1112,6 +1524,7 @@ def _save_detection_crop(frame: np.ndarray, cls_name: str, frame_id: int, det_in
     cv2.imwrite(image_path, crop)
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"class_name": cls_name, "confidence": round(conf, 6), "track_id": track_id, "frame_id": frame_id, "detection_index": det_index, "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}, "crop_path": image_path}, f, indent=2)
+    return image_path
 
 def _preprocess_crop(crop_bgr: np.ndarray) -> np.ndarray:
     h, w = crop_bgr.shape[:2]
@@ -1170,9 +1583,15 @@ def _annotate_frame(frame: np.ndarray, boxes_data: list[tuple], assoc_map: dict[
     return frame
 
 def _det_key(track_id: int | None, frame_id: int, det_idx: int, truck_tid: int | None = None, field: str | None = None) -> str:
+    # Frame-unique so every captured crop is tracked independently. The per-(field,
+    # truck) budget controls HOW MANY crops we submit; cross-frame aggregation
+    # happens in the registry's _ocr_history majority vote. A non-frame-unique key
+    # would collapse all crops of a field into a single cache/pending entry.
     if truck_tid is not None and field is not None:
-        return f"truck_{truck_tid}_{field}"
-    return f"t{track_id}" if track_id is not None else f"f{frame_id}_i{det_idx}"
+        return f"truck_{truck_tid}_{field}_f{frame_id}"
+    if track_id is not None:
+        return f"t{track_id}_f{frame_id}"
+    return f"f{frame_id}_i{det_idx}"
 
 FIELD_MEDIA_DIR = os.path.join(OUTPUT_DIR, "field_media")
 
@@ -1227,12 +1646,50 @@ def _ocr_worker() -> None:
             if _sj is not None:
                 _sj.ocr_log.append(send_log)
                 _sj.ocr_log = _sj.ocr_log[-5000:]
-        md_text = _call_mineru_ocr(crop_rgb)
-        plain_text = _parse_mineru_markdown(md_text) if md_text else None
-        image_path = _extract_mineru_image(md_text) if md_text else None
+        md_text = ""
+        plain_text = None
+        image_path = None
+        ocr_status = "empty"
+        ocr_provider = "PaddleOCR" if PADDLE_OCR_PRIMARY else "MinerU"
+
+        if PADDLE_OCR_PRIMARY:
+            # PRIMARY: local GPU PaddleOCR (fast). Reads come back in ~ms so they
+            # stream to the frontend during the run instead of waiting on the cloud.
+            pd_text, pd_status = _call_paddle_ocr(crop_rgb)
+            if pd_text:
+                plain_text = pd_text
+                ocr_status = pd_status
+                print(f"  [OCR] ✓ PaddleOCR (primary) read '{field}' → '{pd_text}'", flush=True)
+            if not plain_text:
+                # FALLBACK: MinerU cloud when Paddle yields nothing / is unavailable.
+                md_text, m_status = _call_mineru_ocr(crop_rgb)
+                m_parsed = _parse_mineru_markdown(md_text) if md_text else None
+                if m_parsed:
+                    plain_text = m_parsed
+                    image_path = _extract_mineru_image(md_text)
+                    ocr_status = m_status
+                    ocr_provider = "MinerU"
+                    print(f"  [OCR] ⤵ MinerU fallback recovered '{field}' → '{m_parsed}'", flush=True)
+                elif ocr_status == "empty":
+                    ocr_status = m_status
+        else:
+            # Legacy order: MinerU cloud primary, PaddleOCR as the local fallback.
+            md_text, ocr_status = _call_mineru_ocr(crop_rgb)
+            plain_text = _parse_mineru_markdown(md_text) if md_text else None
+            image_path = _extract_mineru_image(md_text) if md_text else None
+            ocr_provider = "MinerU"
+            if not plain_text and PADDLE_OCR_FALLBACK:
+                pd_text, pd_status = _call_paddle_ocr(crop_rgb)
+                if pd_text:
+                    plain_text = pd_text
+                    image_path = None  # Paddle returns text only, no MinerU crop image
+                    ocr_status = pd_status
+                    ocr_provider = "PaddleOCR"
+                    print(f"  [OCR] ⤵ PaddleOCR fallback recovered '{field}' → '{pd_text}'", flush=True)
+
         print(
-            f"  [OCR←RECV] [f{frame_id}] field='{field}'  raw_chars={len(md_text or '')}  "
-            f"parsed='{plain_text if plain_text else ''}'",
+            f"  [OCR←RECV] [f{frame_id}] field='{field}'  provider={ocr_provider}  "
+            f"raw_chars={len(md_text or '')}  parsed='{plain_text if plain_text else ''}'",
             flush=True,
         )
         with _jobs_lock:
@@ -1279,7 +1736,19 @@ def _ocr_worker() -> None:
                 print(f"  [OCR] ✓ {key} → '{plain_text}'", flush=True)
             else:
                 job.submitted_keys.discard(key)
-                print(f"  [OCR] ✗ {key} — will retry")
+                # A MinerU timeout/error is a transient miss, not a real empty read:
+                # refund the budget slot and clear the conf floor so this field is
+                # re-sampled within the SAME truck id rather than counted as spent.
+                if ocr_status in ("timeout", "error"):
+                    owner = truck_tid if truck_tid is not None else child_track_id
+                    if owner is not None:
+                        bkey = (field, owner)
+                        if job.ocr_field_count.get(bkey, 0) > 0:
+                            job.ocr_field_count[bkey] -= 1
+                        job.ocr_best_conf[bkey] = 0.0
+                    print(f"  [OCR] ⏱ {key} MinerU {ocr_status} — refunded budget, will retry")
+                else:
+                    print(f"  [OCR] ✗ {key} — empty parse")
         _ocr_queue.task_done()
 
 for _ in range(OCR_WORKERS):
@@ -1316,6 +1785,14 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         "ocr_every_n_frames": OCR_EVERY_N_FRAMES, "camera": job.camera_source if job is not None else "",
     }
     camera_src = job.camera_source if job is not None else ""
+    # No ROI / lane / gate. Trucks are tracked by plain ByteTrack + IoU permanent ids,
+    # with a geometric 2D-position guard so two trucks in frame at once but at different
+    # coordinates stay on separate ids. Separation threshold = a fraction of the frame
+    # size per axis (scales to any resolution).
+    sep_x = TRUCK_SEP_FRAC * w_orig
+    sep_y = TRUCK_SEP_FRAC * h_orig
+    print(f"[PlateFlow] '{camera_src or 'default'}': truck position separation "
+          f"sep_x={sep_x:.0f}px sep_y={sep_y:.0f}px (TRUCK_SEP_FRAC={TRUCK_SEP_FRAC})", flush=True)
     camera_stats = CameraDetectionStats(camera=camera_src or "default")
     registry = TruckRegistry(fps=fps, camera_source=camera_src)
     if job is not None:
@@ -1342,6 +1819,10 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         infer_ms = (time.time() - t0) * 1000
         boxes_data: list[tuple] = []
         ocr_map: dict[int, str] = {}
+        # Crop path for each truck-class detection this frame, keyed by RAW ByteTrack id
+        # (unique per frame), so the per-frame track log can carry the same crop_path the
+        # detection-crop JSON uses.
+        crop_paths_this_frame: dict[int, str | None] = {}
         boxes_raw = results[0].boxes if results else None
         masks_raw = results[0].masks if results else None
         if boxes_raw is not None and len(boxes_raw) > 0:
@@ -1379,15 +1860,53 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                     camera_stats.yolo_with_container += 1
                 elif cls_name == "truck_without_container":
                     camera_stats.yolo_without_container += 1
-                _save_detection_crop(frame_orig, cls_name, frame_id, i, conf_val, track_id, (x1, y1, x2, y2), detections_dir=detections_dir)
+                crop_path = _save_detection_crop(frame_orig, cls_name, frame_id, i, conf_val, track_id, (x1, y1, x2, y2), detections_dir=detections_dir)
+                if cls_name in TRUCK_CLASSES and track_id is not None:
+                    crop_paths_this_frame[track_id] = crop_path
         boxes_data = _dedupe_truck_detections(boxes_data, class_names)
         if job is not None:
             remapped: list[tuple] = []
             for x1, y1, x2, y2, cls_id, conf_val, track_id, mask in boxes_data:
                 cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
                 if cls_name in TRUCK_CLASSES and track_id is not None:
-                    perm_id = _get_perm_truck_id(job, track_id, (x1, y1, x2, y2), registry, frame_id)
+                    # Raw ByteTrack id -> stable permanent id via IoU merge (+ 2D-position guard).
+                    perm_id = _get_perm_truck_id(job, track_id, (x1, y1, x2, y2), registry, frame_id, sep_x=sep_x, sep_y=sep_y)
+                    # Appearance (ReID) split: if this detection is kept on an id whose
+                    # established colour signature it no longer matches — for several
+                    # consecutive frames — it is a DIFFERENT physical truck that stopped
+                    # at the same spot, so give it a fresh id. This is what separates
+                    # trucks the tracker glues by box overlap over time.
+                    if APPEARANCE_SPLIT and not virtual_truck_mode:
+                        sig = _crop_hsv_sig(frame_orig, (x1, y1, x2, y2))
+                        if sig is not None:
+                            ref = job.perm_appearance.get(perm_id)
+                            if ref is None:
+                                job.perm_appearance[perm_id] = sig
+                                job.appearance_divergence.pop(track_id, None)
+                            elif _appearance_corr(sig, ref) < APPEARANCE_MATCH_THRESH:
+                                cnt = job.appearance_divergence.get(track_id, 0) + 1
+                                job.appearance_divergence[track_id] = cnt
+                                if cnt >= APPEARANCE_SPLIT_PATIENCE:
+                                    new_perm = job._next_perm_id
+                                    job._next_perm_id += 1
+                                    job.raw_to_perm_id[track_id] = new_perm
+                                    job.perm_appearance[new_perm] = sig
+                                    job.appearance_divergence[track_id] = 0
+                                    print(f"  [APPEARANCE-SPLIT] raw T#{track_id} no longer matches perm T#{perm_id} "
+                                          f"(corr<{APPEARANCE_MATCH_THRESH}) → new perm T#{new_perm} @f{frame_id}")
+                                    perm_id = new_perm
+                            else:
+                                job.appearance_divergence[track_id] = 0
+                                # Slowly adapt the signature to lighting/angle drift.
+                                job.perm_appearance[perm_id] = 0.9 * ref + 0.1 * sig
                     remapped.append((x1, y1, x2, y2, cls_id, conf_val, perm_id, mask))
+                    # Per-frame track log for the cross-camera supervisor: raw ByteTrack id
+                    # (for spatial-jump re-splits) + this engine's perm id (bridges to the
+                    # final per-truck record whose track_id == perm_id).
+                    registry.record_frame_track(
+                        frame_id, track_id, perm_id, cls_name, conf_val,
+                        (x1, y1, x2, y2), crop_paths_this_frame.get(track_id),
+                    )
                     # ByteTrack raw unique-ID counter (raw ByteTrack IDs before perm-ID consolidation)
                     if cls_name == "truck_with_container":
                         camera_stats.bytetrack_ids_with_container.add(track_id)
@@ -1431,25 +1950,26 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         else:
             assoc_map = _build_association_map_integrated(boxes_data, job if job is not None else None, class_names)
         if job is not None and frame_id % OCR_RETRY_EVERY == 0 and frame_id > 0:
-            with _jobs_lock:
-                for i, (x1, y1, x2, y2, cls_id, _conf, track_id, _mask) in enumerate(boxes_data):
-                    cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
-                    if cls_name not in OCR_CLASSES or i not in assoc_map:
-                        continue
-                    truck_tid, truck_type, fld = assoc_map[i]
-                    if registry.field_is_empty(truck_tid, fld):
-                        retry_key = _det_key(track_id, frame_id, i, truck_tid, fld)
-                        if retry_key in job.submitted_keys:
-                            job.submitted_keys.discard(retry_key)
-                            job.pending_keys.discard(retry_key)
-                            print(f"  [RETRY] f{frame_id} T#{truck_tid} field='{fld}' unlocked for re-submission")
+            for i, (x1, y1, x2, y2, cls_id, _conf, track_id, _mask) in enumerate(boxes_data):
+                cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
+                if cls_name not in OCR_CLASSES or i not in assoc_map:
+                    continue
+                truck_tid, truck_type, fld = assoc_map[i]
+                # field_is_empty takes registry._lock — call it OUTSIDE _jobs_lock.
+                if registry.field_is_empty(truck_tid, fld):
+                    bkey = (fld, truck_tid)
+                    with _jobs_lock:
+                        if job.ocr_field_count.get(bkey, 0) < OCR_FRAMES_PER_FIELD * OCR_BUDGET_CEILING_MULT:
+                            # Relax the conf floor so the next decent crop re-submits
+                            # even if it does not beat the running best.
+                            job.ocr_best_conf[bkey] = 0.0
+                            print(f"  [RETRY] f{frame_id} T#{truck_tid} '{fld}' empty -> relax conf floor (count={job.ocr_field_count.get(bkey, 0)})")
         if job is not None:
             with _jobs_lock:
-                submitted = set(job.submitted_keys)
                 cached = dict(job.ocr_cache)
                 pending = set(job.pending_keys)
         else:
-            submitted, cached, pending = set(), {}, set()
+            cached, pending = {}, set()
         for i, (x1, y1, x2, y2, cls_id, conf_val, track_id, _mask) in enumerate(boxes_data):
             cls_name = class_names[cls_id] if cls_id < len(class_names) else str(cls_id)
             if cls_name not in OCR_CLASSES:
@@ -1471,19 +1991,39 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
                 ocr_map[i] = cached[key]
             should_submit = False
             if job is not None:
+                # Scope the capture budget to the parent TRUCK id once known, else the
+                # raw child track id (transferred to the truck on lock). Sample at
+                # least OCR_FRAMES_PER_FIELD crops per (field, truck); keep sampling
+                # the higher-confidence ones while still empty + active, up to a hard
+                # ceiling; then stop. A fresh truck id starts a clean budget, so a
+                # later truck never overwrites an earlier truck's reads.
                 owner_id = truck_tid if truck_tid is not None else track_id
-                best_key = (field, owner_id) if owner_id is not None else None
-                if best_key:
+                if owner_id is not None:
+                    budget_key = (field, owner_id)
+                    field_filled = (
+                        truck_tid is not None
+                        and registry is not None
+                        and not registry.field_is_empty(truck_tid, field)
+                    )
                     with _jobs_lock:
-                        prev_best = job.ocr_best_conf.get(best_key, 0.0)
-                        if conf_val > prev_best:
-                            job.ocr_best_conf[best_key] = conf_val
+                        count = job.ocr_field_count.get(budget_key, 0)
+                        last_frame = job.ocr_field_last_frame.get(budget_key, -10**9)
+                        prev_best = job.ocr_best_conf.get(budget_key, 0.0)
+                        stride_ok = (frame_id - last_frame) >= OCR_SAMPLE_STRIDE
+                        ceiling = OCR_FRAMES_PER_FIELD * OCR_BUDGET_CEILING_MULT
+                        if stride_ok:
+                            if count < OCR_FRAMES_PER_FIELD:
+                                should_submit = True
+                            elif not field_filled and count < ceiling:
+                                should_submit = conf_val > prev_best
+                        if should_submit:
+                            job.ocr_field_count[budget_key] = count + 1
+                            job.ocr_field_last_frame[budget_key] = frame_id
+                            if conf_val > prev_best:
+                                job.ocr_best_conf[budget_key] = conf_val
                             job.submitted_keys.discard(key)
                             job.pending_keys.discard(key)
-                            should_submit = True
-                            print(f"  [OCR-BEST] {field} owner#{owner_id} conf={conf_val:.3f} > prev={prev_best:.3f}")
-                elif key not in pending and key not in submitted:
-                    should_submit = True
+                            print(f"  [OCR-BUDGET] {field} owner#{owner_id} #{count + 1}/{OCR_FRAMES_PER_FIELD} conf={conf_val:.3f} filled={field_filled}")
             if should_submit and job is not None:
                 _enqueue_ocr(job.job_id, key, _preprocess_crop(crop_bgr), field, frame_id, truck_tid, truck_type, track_id, conf=conf_val)
         n_cache = len(cached)
@@ -1495,6 +2035,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
         n_locked = len(job.child_to_truck) if job else 0
         n_voting = len(job.child_assoc_votes) if job else 0
         pending_track_ids: set[int] = {int(k[1:]) for k in pending if k.startswith("t") and k[1:].isdigit()}
+        # No ROI/lane/gate overlays — plain detections only.
         annotated = _annotate_frame(frame_orig.copy(), boxes_data, assoc_map, ocr_map, pending_track_ids, job, class_names)
         cv2.putText(annotated, f"Frame {frame_id}/{total_frames} ({pct}%)  |  {fps_smooth:.1f} FPS  |  {infer_ms:.0f} ms", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(annotated, f"Trucks tracked: {n_trucks}  |  OCR done: {n_cache}  pending: {n_pending}  queue: {q_size}  |  {gpu_txt}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (180, 255, 180), 1, cv2.LINE_AA)
@@ -1518,7 +2059,7 @@ def _run_video_analysis(video_path: str, job: VideoJob | None = None) -> dict[st
     session_info["finished_at"] = datetime.now().isoformat(timespec="seconds")
     session_info["frames_processed"] = frame_id
     session_info["camera_detection_stats"] = camera_stats.to_dict()
-    final_data = registry.to_dict(session_info)
+    final_data = registry.to_dict(session_info, include_frame_tracks=True)
     if job is not None:
         _set_job(job.job_id, json_snapshot=json.dumps(final_data, indent=2))
     return final_data
@@ -1563,7 +2104,7 @@ def _run_job(job_id: str) -> None:
         if job.registry is not None:
             print("[PlateFlow] Running post-processing ID consolidation…", flush=True)
             _consolidate_perm_ids(job, job.registry)
-        final_result = job.registry.to_dict(job.session_info) if job.registry is not None else {}
+        final_result = job.registry.to_dict(job.session_info, include_frame_tracks=True) if job.registry is not None else {}
         _set_job(job_id, state="completed", progress=1.0, result=final_result, json_snapshot=json.dumps(final_result, indent=2), message="Video processing completed.")
     except Exception as exc:
         _set_job(job_id, state="failed", error=str(exc), message=f"Video processing failed: {exc}")

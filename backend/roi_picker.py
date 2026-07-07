@@ -37,6 +37,13 @@ import numpy as np
 MAX_LANES = 2
 # BGR colours — one per lane
 LANE_COLORS = [(0, 240, 80), (80, 100, 255)]
+GATE_COLOR = (60, 200, 255)   # amber — the gate tripwire
+ROI_COLOR = (221, 138, 55)    # blue — the single ROI rectangle
+
+# Set True by --gate: pick a 2-point gate tripwire instead of lane polygons.
+GATE_MODE = False
+# Set True by --roi: pick a single 2-corner rectangular ROI (the new default flow).
+ROI_MODE = False
 
 # ── state shared with the mouse callback ──────────────────────────────────────
 _state: dict = {
@@ -44,6 +51,8 @@ _state: dict = {
     "all_lanes": [],       # list[list[tuple[int,int]]]  – completed lanes
     "current_pts": [],     # list[tuple[int,int]]        – lane being defined
     "current_lane": 0,
+    "gate_pts": [],        # list[tuple[int,int]]        – the 2 gate-line endpoints
+    "roi_pts": [],         # list[tuple[int,int]]        – the 2 ROI-rectangle corners
     "mouse_pos": (0, 0),
 }
 WIN = "ROI Lane Picker"
@@ -51,7 +60,63 @@ WIN = "ROI Lane Picker"
 
 # ── rendering ─────────────────────────────────────────────────────────────────
 
+def _render_gate() -> np.ndarray:
+    """Render the gate-line picker: 2 endpoints + the tripwire between them."""
+    vis = _state["frame"].copy()
+    pts = _state["gate_pts"]
+    mx, my = _state["mouse_pos"]
+    for i, p in enumerate(pts):
+        cv2.circle(vis, p, 7, GATE_COLOR, -1, cv2.LINE_AA)
+        cv2.putText(vis, str(i + 1), (p[0] + 9, p[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, GATE_COLOR, 2, cv2.LINE_AA)
+    if len(pts) == 2:
+        cv2.line(vis, pts[0], pts[1], GATE_COLOR, 3, cv2.LINE_AA)
+    elif len(pts) == 1:
+        cv2.line(vis, pts[0], (mx, my), GATE_COLOR, 1, cv2.LINE_AA)
+    lines = [
+        f"Drawing GATE LINE  —  {len(pts)}/2 points",
+        "LClick=add  RClick=undo  Space=+30fr  B=-30fr  R=reset  S=save  Q=quit",
+    ]
+    for i, txt in enumerate(lines):
+        y = 30 + i * 28
+        cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+    return vis
+
+
+def _render_roi() -> np.ndarray:
+    """Render the single-ROI picker: 2 opposite corners + the rectangle between them."""
+    vis = _state["frame"].copy()
+    pts = _state["roi_pts"]
+    mx, my = _state["mouse_pos"]
+    p2 = pts[1] if len(pts) == 2 else ((mx, my) if len(pts) == 1 else None)
+    if len(pts) >= 1 and p2 is not None:
+        x1, y1 = pts[0]
+        x2, y2 = p2
+        cv2.rectangle(vis, (min(x1, x2), min(y1, y2)), (max(x1, x2), max(y1, y2)),
+                      ROI_COLOR, 2, cv2.LINE_AA)
+        cv2.putText(vis, "ROI", (min(x1, x2) + 6, min(y1, y2) + 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, ROI_COLOR, 2, cv2.LINE_AA)
+    for i, p in enumerate(pts):
+        cv2.circle(vis, p, 7, ROI_COLOR, -1, cv2.LINE_AA)
+        cv2.putText(vis, str(i + 1), (p[0] + 9, p[1] - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, ROI_COLOR, 2, cv2.LINE_AA)
+    lines = [
+        f"Drawing ROI RECTANGLE  —  {len(pts)}/2 corners",
+        "LClick=add corner  RClick=undo  Space=+30fr  B=-30fr  R=reset  S=save  Q=quit",
+    ]
+    for i, txt in enumerate(lines):
+        y = 30 + i * 28
+        cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 1, cv2.LINE_AA)
+    return vis
+
+
 def _render() -> np.ndarray:
+    if ROI_MODE:
+        return _render_roi()
+    if GATE_MODE:
+        return _render_gate()
     vis = _state["frame"].copy()
     all_lanes: list = _state["all_lanes"]
     current_pts: list = _state["current_pts"]
@@ -107,6 +172,32 @@ def _render() -> np.ndarray:
 def _on_mouse(event: int, x: int, y: int, _flags: int, _param) -> None:
     _state["mouse_pos"] = (x, y)
 
+    if ROI_MODE:
+        pts = _state["roi_pts"]
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if len(pts) >= 2:
+                pts.clear()  # third click starts a fresh rectangle
+            pts.append((x, y))
+            print(f"  [ROI] Corner {len(pts)}: ({x}, {y})")
+            if len(pts) == 2:
+                print("  ROI rectangle complete — press S to save, R to redo.")
+        elif event == cv2.EVENT_RBUTTONDOWN and pts:
+            print(f"  Removed ROI corner {pts.pop()}")
+        cv2.imshow(WIN, _render())
+        return
+
+    if GATE_MODE:
+        pts = _state["gate_pts"]
+        if event == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
+            pts.append((x, y))
+            print(f"  [Gate] Point {len(pts)}: ({x}, {y})")
+            if len(pts) == 2:
+                print("  Gate line complete — press S to save, R to redo.")
+        elif event == cv2.EVENT_RBUTTONDOWN and pts:
+            print(f"  Removed gate point {pts.pop()}")
+        cv2.imshow(WIN, _render())
+        return
+
     if event == cv2.EVENT_LBUTTONDOWN:
         pts = _state["current_pts"]
         if len(pts) < 4:
@@ -129,7 +220,66 @@ def _on_mouse(event: int, x: int, y: int, _flags: int, _param) -> None:
 
 # ── save helper ───────────────────────────────────────────────────────────────
 
+def _save_gate(video_path: str, frame_no: int, camera_name: str = "") -> None:
+    pts = _state["gate_pts"]
+    if len(pts) != 2:
+        print(f"  Need 2 points for the gate line — have {len(pts)}.")
+        return
+    # Engine's _load_gate_line() reads {camera}_gate_line.json (then *_lane_rois.json)
+    # from the directory local_inference.py lives in (backend/). roi_picker.py is in
+    # that same dir, so write there.
+    stem = f"{camera_name}_gate_line" if camera_name else "gate_line"
+    out_path = Path(__file__).resolve().parent / f"{stem}.json"
+    payload = {
+        "video": str(video_path),
+        "camera": camera_name,
+        "frame": frame_no,
+        "gate_line": [list(pts[0]), list(pts[1])],
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    print(f"\n[ROI Picker] Saved gate line → {out_path}")
+    print(f"  gate_line = {payload['gate_line']}\n")
+
+
+def _save_roi(video_path: str, frame_no: int, camera_name: str = "") -> None:
+    pts = _state["roi_pts"]
+    if len(pts) != 2:
+        print(f"  Need 2 corners for the ROI rectangle — have {len(pts)}.")
+        return
+    # Engine's _load_roi() reads the `roi` key of {camera}_lane_rois.json from the
+    # directory local_inference.py lives in (backend/); write there.
+    stem = f"{camera_name}_lane_rois" if camera_name else "lane_rois"
+    out_path = Path(__file__).resolve().parent / f"{stem}.json"
+    # Preserve any existing lanes/gate_line already saved for this camera.
+    existing: dict = {}
+    if out_path.exists():
+        try:
+            existing = json.loads(out_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    h, w = _state["frame"].shape[:2]
+    (x1, y1), (x2, y2) = pts
+    payload = {
+        **existing,
+        "video": str(video_path),
+        "camera": camera_name,
+        "frame": frame_no,
+        "image_width": int(w),
+        "image_height": int(h),
+        "roi": [[min(x1, x2), min(y1, y2)], [max(x1, x2), max(y1, y2)]],
+    }
+    out_path.write_text(json.dumps(payload, indent=2))
+    print(f"\n[ROI Picker] Saved ROI → {out_path}")
+    print(f"  roi = {payload['roi']}  ({w}x{h})\n")
+
+
 def _save(video_path: str, frame_no: int, camera_name: str = "") -> None:
+    if ROI_MODE:
+        _save_roi(video_path, frame_no, camera_name)
+        return
+    if GATE_MODE:
+        _save_gate(video_path, frame_no, camera_name)
+        return
     lanes_to_save = list(_state["all_lanes"])
     if len(_state["current_pts"]) == 4:
         lanes_to_save.append(list(_state["current_pts"]))
@@ -185,7 +335,12 @@ def main(video_path: str, camera_name: str = "") -> None:
 
     cam_label = f"  camera='{camera_name}'" if camera_name else ""
     print(f"\n[ROI Picker] Opened: {video_path}  ({w}x{h}, {total} frames){cam_label}")
-    print("Click 4 corners to define Lane 1 ROI.\n")
+    if ROI_MODE:
+        print("ROI MODE: click 2 opposite corners to draw the rectangular ROI, then S to save.\n")
+    elif GATE_MODE:
+        print("GATE MODE: click 2 points across the lane to draw the tripwire, then S to save.\n")
+    else:
+        print("Click 4 corners to define Lane 1 ROI.\n")
 
     saved = False
     while True:
@@ -195,12 +350,19 @@ def main(video_path: str, camera_name: str = "") -> None:
             print("[ROI Picker] Quit without saving.")
             break
 
-        elif key == ord('r'):               # R — reset current lane
-            _state["current_pts"].clear()
-            print(f"  Reset Lane {_state['current_lane'] + 1}")
+        elif key == ord('r'):               # R — reset current lane / gate line / ROI
+            if ROI_MODE:
+                _state["roi_pts"].clear()
+                print("  Reset ROI rectangle")
+            elif GATE_MODE:
+                _state["gate_pts"].clear()
+                print("  Reset gate line")
+            else:
+                _state["current_pts"].clear()
+                print(f"  Reset Lane {_state['current_lane'] + 1}")
             cv2.imshow(WIN, _render())
 
-        elif key == ord('n'):               # N — finish lane, start next
+        elif key == ord('n') and not GATE_MODE and not ROI_MODE:   # N — finish lane, start next (lane mode only)
             pts = _state["current_pts"]
             if len(pts) == 4:
                 _state["all_lanes"].append(list(pts))
@@ -256,5 +418,18 @@ if __name__ == "__main__":
         help="Camera name (e.g. front, right, left). "
              "Saves as  {camera}_lane_rois.json  so local_inference.py loads it per camera.",
     )
+    parser.add_argument(
+        "--gate", action="store_true",
+        help="Gate-line mode: click 2 points to draw the tripwire (saved as "
+             "{camera}_gate_line.json) instead of 4-point lane polygons.",
+    )
+    parser.add_argument(
+        "--roi", action="store_true",
+        help="Single-ROI mode: click 2 opposite corners to draw one rectangular ROI "
+             "(saved as the `roi` key of {camera}_lane_rois.json). This is the new, "
+             "generic separation region the engine reads via _load_roi.",
+    )
     args = parser.parse_args()
+    GATE_MODE = args.gate
+    ROI_MODE = args.roi
     main(args.video, camera_name=args.camera)

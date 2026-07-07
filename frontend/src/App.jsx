@@ -149,6 +149,9 @@ function readTruckFields(truck) {
     trackId: pickFirst(truck?.track_id),
     truckClass: pickFirst(truck?.truck_type, truck?.type),
     camera: pickFirst(truck?.camera, truck?.associated_info?._fusion?.source_cameras?.[0]),
+    // Lane the truck was detected in (its lane ROI). Top-level on live runs;
+    // associated_info._lane survives the DB round-trip.
+    lane: (truck?.lane ?? truck?.associated_info?._lane) ?? null,
     fieldCameras,
     ...fieldTexts,
     ...Object.fromEntries(Object.entries(fieldConfs).map(([k, v]) => [k + "_conf", v])),
@@ -1086,7 +1089,7 @@ export default function App() {
                   </div>
                   <div className={showAllLogs ? "ocr-log-scroll ocr-log-scroll-full" : "ocr-log-scroll"}>
                     {(showAllLogs ? ocrLog : ocrLog.slice(-12)).map((line, idx) => (
-                      <div key={idx} className={`ocr-log-line ${line.includes('LOCKED') ? 'log-locked' : line.includes('VOTE') ? 'log-vote' : line.includes('BEST') ? 'log-best' : line.includes('orphan') ? 'log-orphan' : ''}`}>
+                      <div key={idx} className={`ocr-log-line ${line.includes('RECV') ? 'log-read' : line.includes('LOCKED') ? 'log-locked' : line.includes('VOTE') ? 'log-vote' : line.includes('BEST') ? 'log-best' : line.includes('orphan') ? 'log-orphan' : ''}`}>
                         {line}
                       </div>
                     ))}
@@ -1206,6 +1209,7 @@ export default function App() {
                             {fields.camera
                               ? <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>
                               : <span className="cam-source-chip cam-source-unknown">—</span>}
+                            {fields.lane != null && <span className="lane-chip">L{fields.lane}</span>}
                           </td>
                           <td>{fields.trackId}</td>
                           {groupByField && (
@@ -1287,6 +1291,7 @@ export default function App() {
                           </span>
                           <span className="gate-time">{timeRange}</span>
                           {fields.camera && <span className="cam-source-chip">{fields.camera.toUpperCase()}</span>}
+                          {fields.lane != null && <span className="lane-chip">LANE {fields.lane}</span>}
                           <span className={`status-chip status-${status}`}>{status}</span>
                         </div>
                         {camObs.length > 0 ? (

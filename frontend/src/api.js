@@ -148,3 +148,30 @@ export function getVideoTruckRunFrameUrl(jobId) {
 export function getMultiCameraFrameUrl(jobId, camera) {
   return `${API_BASE_URL}/api/truck-runs/multi-camera/${jobId}/frame/${camera}`;
 }
+
+// ── Gate-line setup (draw the gate tripwire in the browser) ─────────────────
+
+// Upload a camera video, get back a still frame (as an object URL) to draw on.
+export async function extractLaneFrame(videoFile, camera) {
+  const formData = new FormData();
+  formData.append("video", videoFile);
+  formData.append("camera", camera);
+  const { data } = await api.post("/api/lane-setup/extract-frame", formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    responseType: "blob",
+    timeout: 120000
+  });
+  return URL.createObjectURL(data);
+}
+
+// Persist the gate line for one camera (coords in NATIVE image pixels).
+export async function saveLaneRois(payload) {
+  const { data } = await api.post("/api/lane-setup/save", payload);
+  return data;
+}
+
+// Read back a saved gate line for re-editing (or { exists:false }).
+export async function getLaneRois(camera) {
+  const { data } = await api.get(`/api/lane-setup/${camera}`);
+  return data;
+}
