@@ -89,7 +89,7 @@ stack-data==0.6.3
 starlette==1.0.0
 stringzilla==4.6.1
 supervision==0.28.0
-sympy==1.14.0
+sympy==1.13.1
 # torch/torchvision are CUDA 12.4 builds from the PyTorch index (required for GPU
 # YOLO); the "+cu124" wheels are NOT on plain PyPI. (Re)install them with:
 #   pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
