@@ -131,6 +131,13 @@ class Settings(BaseSettings):
     # the app's main log). The directory is created if missing.
     supervisor_log_path: str = "plateflow_outputs/logs/supervisor.log"
     supervisor_log_level: str = "INFO"
+    # PRESENCE-GLUE model. When True, the supervisor's confirmed trucks define the truck
+    # WINDOWS (one truck per continuous physical presence of the front trio; a new truck
+    # only when the frame empties), and consolidation glues EVERY detection whose time
+    # overlaps a window to that ONE truck — nothing is dropped for lack of per-track
+    # cross-camera agreement. When False, the legacy per-perm-id mapping is used (an
+    # observation is dropped unless its (camera, perm_id) belongs to a confirmed truck).
+    supervisor_presence_glue: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,0 +1,47 @@
+# PlateFlow — runs on the EC2 GPU box. Lives at /opt/plateflow/docker-compose.yml
+# next to a .env file (copy of deploy/.env.production.example). The GitHub Actions
+# deploy job runs `docker compose pull && docker compose up -d` here.
+services:
+  plateflow:
+    # Pinned via .env (IMAGE=ghcr.io/<owner>/<repo>:latest). The deploy job pushes
+    # this tag; `docker compose pull` fetches the freshly built image.
+    image: ${IMAGE}
+    container_name: plateflow
+    restart: unless-stopped
+    env_file: .env
+
+    ports:
+      - "8000:8000"          # http://<ec2-public-ip>:8000
+
+    # GPU access via the NVIDIA Container Toolkit. If your Compose version rejects
+    # `gpus: all`, delete it and use the `deploy:` block at the bottom instead.
+    gpus: all
+    shm_size: "2gb"          # headroom for torch/paddle shared memory
+
+    volumes:
+      # Model weights: uploaded once to the host, mounted read-only (never in image).
+      - /opt/plateflow/models:/app/backend/model:ro
+      # SQLite DB + any persisted state (DATABASE_URL points in here).
+      - /opt/plateflow/data:/app/backend/data
+      # Detection crops, merge logs, per-field media — survive redeploys.
+      - /opt/plateflow/outputs:/app/backend/plateflow_outputs
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 180s      # first boot loads the ~565 MB YOLO model onto the GPU
+
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+    # ── Fallback GPU syntax (use ONLY if you removed `gpus: all` above) ──
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

@@ -1,0 +1,36 @@
+# Build context hygiene — keep the image small and reproducible.
+# Models come via a host volume (they're gitignored & ~1.1 GB), never the image.
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+
+# Python virtualenvs (rebuilt inside the image)
+backend/.venv/
+backend/.venv_ocr/
+
+# Model weights & data (mounted at runtime, not baked in)
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.mp4
+**/*.avi
+**/*.db
+backend/plateflow_outputs/
+backend/plateflow_outputs_back/
+backend/plateflow_outputs*/
+runs/
+
+# Secrets / local env
+**/.env
+backend/.mineru_token
+
+# Frontend build artifacts (Stage 1 rebuilds these)
+frontend/node_modules/
+frontend/dist/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+**/.DS_Store
+Thumbs.db

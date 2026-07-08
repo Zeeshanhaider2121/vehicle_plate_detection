@@ -13,6 +13,7 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv_ocr/
 plateflow-env/
 
 # Jupyter
@@ -126,3 +127,17 @@ platform_output/
 # Runtime MinerU token (set from UI)
 backend/.mineru_token
 .mineru_token
+
+backend/plateflow.db
+
+frontend/plateflow.db
+
+backend/plateflow_outputs/
+
+backend/plateflow_outputs_back/
+
+runs/
+
+backend/local_video_log_*.json
+
+deploy/.env.production

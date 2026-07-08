@@ -97,8 +97,11 @@ starlette==1.0.0
 stringzilla==4.6.1
 supervision==0.28.0
 sympy==1.14.0
-torch==2.11.0
-torchvision==0.26.0
+# torch/torchvision are CUDA 12.4 builds from the PyTorch index (required for GPU
+# YOLO); the "+cu124" wheels are NOT on plain PyPI. (Re)install them with:
+#   pip install torch==2.6.0+cu124 torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
 tqdm==4.67.3
 traitlets==5.15.0
 typing-inspect==0.9.0
@@ -110,3 +113,20 @@ urllib3==2.7.0
 uvicorn==0.47.0
 wcwidth==0.7.0
 yarl==1.23.0
+
+# ── Optional: GPU PaddleOCR fallback (SEPARATE venv + worker process) ─────────
+# When a MinerU read fails/empties, backend/ocr_gpu_worker.py OCRs the crop on the
+# GPU. It must NOT be installed into THIS venv: paddlepaddle-gpu ships the same
+# cuDNN/cuBLAS DLL names as this venv's torch-CUDA (YOLO) and the two cannot load
+# in one Windows process (WinError 127). Instead give it its own venv where torch
+# is CPU-only, and the backend spawns it as a subprocess (auto-degrades to MinerU-
+# only if the venv is absent). One-time setup with uv (Python 3.11, CUDA 12.6):
+#   uv venv .venv_ocr --python 3.11
+#   OCRPY=.venv_ocr/Scripts/python.exe
+#   uv pip install --python $OCRPY torch --index-url https://download.pytorch.org/whl/cpu
+#   uv pip install --python $OCRPY paddlepaddle-gpu==3.2.0 \
+#       --index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ \
+#       --extra-index-url https://pypi.org/simple/ --index-strategy unsafe-best-match
+#   uv pip install --python $OCRPY paddleocr==3.2.0
+#   uv pip install --python $OCRPY nvidia-cudnn-cu12==9.9.0.52   # match paddle's cuDNN 9.9
+# Verify:  $OCRPY -c "import paddle; print(paddle.device.cuda.device_count())"   # -> 1

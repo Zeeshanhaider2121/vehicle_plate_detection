@@ -233,6 +233,7 @@ from .supervisor_camera import (  # noqa: E402
 
 SUPERVISOR_ENABLED = settings.supervisor_enabled
 SUPERVISOR_BACK_WINDOW_S = settings.supervisor_back_window_s
+SUPERVISOR_PRESENCE_GLUE = settings.supervisor_presence_glue
 _SUPERVISOR_CONFIG = supervisor_config_from_settings(settings)
 # Wire the dedicated supervisor log file up front so back-attach logging (below) and
 # the supervisor itself share one handler.
@@ -1794,6 +1795,166 @@ def _split_obs_across_confirmed(
     return [pieces[k] for k in range(len(confirmed))]
 
 
+def _window_overlap(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Seconds of temporal overlap between [a0,a1] and [b0,b1] (0 if disjoint)."""
+    return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _best_window_index(
+    o0: float, o1: float, windows: list[tuple[float, float]], slack_s: float
+) -> int | None:
+    """Index of the confirmed truck whose presence window best fits [o0,o1].
+
+    Prefers the largest temporal overlap; when an observation overlaps nothing (a
+    detection that sits in a gap between trucks), it glues to the NEAREST window as long
+    as the gap is within ``slack_s`` — otherwise it is genuine noise between trucks and
+    is dropped. This is the presence-glue rule: one continuous truck owns every
+    detection during (and just around) its presence.
+    """
+    if not windows:
+        return None
+    overlaps = [_window_overlap(o0, o1, w0, w1) for (w0, w1) in windows]
+    best = max(range(len(windows)), key=lambda i: overlaps[i])
+    if overlaps[best] > 0:
+        return best
+    # No overlap — attach to the nearest window within slack.
+    def gap(i: int) -> float:
+        w0, w1 = windows[i]
+        if o1 < w0:
+            return w0 - o1
+        if o0 > w1:
+            return o0 - w1
+        return 0.0
+    nearest = min(range(len(windows)), key=gap)
+    return nearest if gap(nearest) <= slack_s else None
+
+
+def _raw_center_x(obs: dict[str, Any]) -> float | None:
+    """Normalized (0..1) horizontal centre of an observation's bbox WITHOUT the
+    orientation flip — matching the convention the supervisor uses for a confirmed
+    truck's ``cx`` (so the two can be compared directly for lane matching)."""
+    truck = obs.get("truck") or {}
+    bbox = truck.get("union_bbox") or truck.get("last_bbox")
+    frame_w = obs.get("frame_w") or DEFAULT_FRAME_WIDTH
+    if not bbox or len(bbox) < 4 or not frame_w:
+        return None
+    try:
+        cx = (float(bbox[0]) + float(bbox[2])) / 2.0 / float(frame_w)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, cx))
+
+
+def _confirmed_cx(ct: Any, camera: str) -> float:
+    """Representative horizontal centre of a confirmed truck: prefer members from the
+    given camera (same optics), else average across all its members. Used to place a
+    concurrent (same-time-window) observation into the correct lane."""
+    mems = ct.members.get(camera) or ct.members.get(camera.lower()) or []
+    cxs = [m["cx"] for m in mems if m.get("cx") is not None]
+    if not cxs:
+        cxs = [
+            m["cx"] for cam_mems in ct.members.values() for m in cam_mems
+            if m.get("cx") is not None
+        ]
+    return sum(cxs) / len(cxs) if cxs else 0.5
+
+
+def _glue_front_by_window(
+    front: list[dict[str, Any]],
+    confirmed: list[Any],
+    groups: list[dict[str, Any]],
+    sup_log: Any,
+) -> int:
+    """PRESENCE-GLUE: glue every front observation to the confirmed truck whose presence
+    window it most overlaps. Nothing is dropped for lack of per-track cross-camera
+    agreement, and a fused id is NOT time-split — the whole observation joins its one
+    truck (the truck the frame was continuously showing during that time).
+
+    When two trucks are CONCURRENT (side-by-side, so their presence windows coincide),
+    a pure time overlap cannot tell the lanes apart; the observation is then placed into
+    the lane whose horizontal position is nearest — preserving the two-ids side-by-side
+    case while still gluing everything sequential onto one truck."""
+    windows = [(ct.entry_time, ct.exit_time) for ct in confirmed]
+    slack = SUPERVISOR_BACK_WINDOW_S
+    mapped = 0
+    for obs in front:
+        o0, o1 = _obs_t0(obs), _obs_t1(obs)
+        cam = (obs.get("camera") or "").lower()
+        overlapping = [
+            i for i in range(len(windows))
+            if _window_overlap(o0, o1, windows[i][0], windows[i][1]) > 0
+        ]
+        if not overlapping:
+            chosen = _best_window_index(o0, o1, windows, slack)
+            if chosen is None:
+                sup_log.info(
+                    "[GLUE-NONE] %s/T#%s [%.2fs-%.2fs] overlaps no confirmed truck window "
+                    "(> %.0fs from any) — dropped as between-truck noise",
+                    cam, obs["truck"].get("track_id"), o0, o1, slack,
+                )
+                continue
+        elif len(overlapping) == 1:
+            chosen = overlapping[0]
+        else:
+            # Concurrent trucks share the window — assign by horizontal lane.
+            ocx = _raw_center_x(obs)
+            if ocx is None:
+                chosen = max(
+                    overlapping,
+                    key=lambda i: _window_overlap(o0, o1, windows[i][0], windows[i][1]),
+                )
+            else:
+                chosen = min(overlapping, key=lambda i: abs(ocx - _confirmed_cx(confirmed[i], cam)))
+        groups[chosen]["members"].append(obs)
+        mapped += 1
+        sup_log.info(
+            "[GLUE] %s/T#%s [%.2fs-%.2fs] -> truck %d (window %.2fs-%.2fs)",
+            cam, obs["truck"].get("track_id"), o0, o1, chosen + 1,
+            windows[chosen][0], windows[chosen][1],
+        )
+    return mapped
+
+
+def _map_front_by_perm_id(
+    front: list[dict[str, Any]],
+    confirmed: list[Any],
+    groups: list[dict[str, Any]],
+    sup_log: Any,
+) -> int:
+    """LEGACY: map a front observation to a confirmed truck only when its
+    (camera, perm_id) belongs to that truck; observations with no match are DROPPED.
+    A perm_id shared by several confirmed trucks is time-split across them."""
+    perm_map: dict[tuple[str, int], list[int]] = {}
+    for idx, ct in enumerate(confirmed):
+        for cam, mems in ct.members.items():
+            for m in mems:
+                pids = m.get("perm_ids") or ([m["perm_id"]] if m.get("perm_id") is not None else [])
+                for pid in pids:
+                    perm_map.setdefault((cam.lower(), int(pid)), []).append(idx)
+
+    mapped = 0
+    for obs in front:
+        cam = (obs.get("camera") or "").lower()
+        tid = _safe_int(obs["truck"].get("track_id"))
+        idxs = perm_map.get((cam, tid), []) if tid is not None else []
+        if not idxs:
+            sup_log.info(
+                "[REJECTED] %s/T#%s [%.2fs-%.2fs] not part of any confirmed truck "
+                "(no front-trio agreement) — dropped from consolidation",
+                cam, obs["truck"].get("track_id"), _obs_t0(obs), _obs_t1(obs),
+            )
+            continue
+        if len(idxs) == 1:
+            groups[idxs[0]]["members"].append(obs)
+            mapped += 1
+        else:
+            pieces = _split_obs_across_confirmed(obs, [confirmed[i] for i in idxs])
+            for i, piece in zip(idxs, pieces):
+                groups[i]["members"].append(piece)
+            mapped += 1
+    return mapped
+
+
 def _supervisor_front_groups(
     front: list[dict[str, Any]],
     frame_tracks_by_cam: dict[str, list[dict[str, Any]]],
@@ -1819,39 +1980,15 @@ def _supervisor_front_groups(
         _mc_log("[SUPERVISOR] no trucks confirmed from per-frame logs — using legacy sweep")
         return None
 
-    # (camera, perm_id) -> indices of confirmed trucks that claim it.
-    perm_map: dict[tuple[str, int], list[int]] = {}
-    for idx, ct in enumerate(confirmed):
-        for cam, mems in ct.members.items():
-            for m in mems:
-                pids = m.get("perm_ids") or ([m["perm_id"]] if m.get("perm_id") is not None else [])
-                for pid in pids:
-                    perm_map.setdefault((cam.lower(), int(pid)), []).append(idx)
-
     groups: list[dict[str, Any]] = [
         {"members": [], "last_seen": ct.exit_time, "confirmed": ct} for ct in confirmed
     ]
     sup_log = get_supervisor_logger()
-    mapped = 0
-    for obs in front:
-        cam = (obs.get("camera") or "").lower()
-        tid = _safe_int(obs["truck"].get("track_id"))
-        idxs = perm_map.get((cam, tid), []) if tid is not None else []
-        if not idxs:
-            sup_log.info(
-                "[REJECTED] %s/T#%s [%.2fs-%.2fs] not part of any confirmed truck "
-                "(no front-trio agreement) — dropped from consolidation",
-                cam, obs["truck"].get("track_id"), _obs_t0(obs), _obs_t1(obs),
-            )
-            continue
-        if len(idxs) == 1:
-            groups[idxs[0]]["members"].append(obs)
-            mapped += 1
-        else:
-            pieces = _split_obs_across_confirmed(obs, [confirmed[i] for i in idxs])
-            for i, piece in zip(idxs, pieces):
-                groups[i]["members"].append(piece)
-            mapped += 1
+
+    if SUPERVISOR_PRESENCE_GLUE:
+        mapped = _glue_front_by_window(front, confirmed, groups, sup_log)
+    else:
+        mapped = _map_front_by_perm_id(front, confirmed, groups, sup_log)
 
     if mapped == 0:
         # Confirmed trucks exist but no front record lined up with them (e.g. perm ids
